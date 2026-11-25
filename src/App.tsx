@@ -21,6 +21,7 @@ import type {
   PeladaSession,
   PlayerProfile,
   PlayerStatsSummary,
+  RecurringPeladaRule,
   TeamRoster,
 } from './types';
 import { ApiError, apiFetch } from './utils/api';
@@ -42,6 +43,7 @@ export default function App() {
   const [players, setPlayers] = useState<PlayerProfile[]>([]);
   const [finance, setFinance] = useState<FinanceEntry[]>([]);
   const [peladas, setPeladas] = useState<PeladaSession[]>([]);
+  const [recurringRules, setRecurringRules] = useState<RecurringPeladaRule[]>([]);
   const [stats, setStats] = useState<Record<string, PlayerStatsSummary>>({});
   const [loadingData, setLoadingData] = useState(false);
   const [globalError, setGlobalError] = useState<string | null>(null);
@@ -52,6 +54,7 @@ export default function App() {
     setPlayers([]);
     setFinance([]);
     setPeladas([]);
+    setRecurringRules([]);
     setStats({});
     setSelectedPeladaId(null);
     setActiveTab('home');
@@ -70,6 +73,7 @@ export default function App() {
           apiFetch<{
             peladas: PeladaSession[];
             stats: Record<string, PlayerStatsSummary>;
+            recurringRules: RecurringPeladaRule[];
           }>('/api/peladas', {}, authToken),
         ]);
 
@@ -77,6 +81,7 @@ export default function App() {
         setPlayers(playersRes.players);
         setFinance(financeRes.entries);
         setPeladas(peladasRes.peladas);
+        setRecurringRules(peladasRes.recurringRules || []);
         setStats(peladasRes.stats);
         setSelectedPeladaId((prev) => {
           if (prev && peladasRes.peladas.some((p) => p.id === prev)) return prev;
@@ -105,8 +110,10 @@ export default function App() {
         const res = await apiFetch<{
           peladas: PeladaSession[];
           stats: Record<string, PlayerStatsSummary>;
+          recurringRules: RecurringPeladaRule[];
         }>('/api/peladas', {}, token);
         setPeladas(res.peladas);
+        setRecurringRules(res.recurringRules || []);
         setStats(res.stats);
       } catch {
         // Silent background refresh
@@ -120,8 +127,10 @@ export default function App() {
     const res = await apiFetch<{
       peladas: PeladaSession[];
       stats: Record<string, PlayerStatsSummary>;
+      recurringRules: RecurringPeladaRule[];
     }>('/api/peladas', {}, token);
     setPeladas(res.peladas);
+    setRecurringRules(res.recurringRules || []);
     setStats(res.stats);
   }
 
@@ -201,9 +210,12 @@ export default function App() {
     title: string;
     date: string;
     time: string;
+    scheduledAt?: string;
     location: string;
     teamCount: number;
+    playersPerTeam: number;
     presentPlayerIds: string[];
+    isRecurring?: boolean;
   }) {
     if (!token) throw new Error('Não autenticado');
     const res = await apiFetch<{ pelada: PeladaSession }>(
@@ -225,6 +237,46 @@ export default function App() {
     await refreshPeladasAndStats();
   }
 
+  async function handleCancelPelada(id: string, reason?: string) {
+    if (!token) throw new Error('Não autenticado');
+    const res = await apiFetch<{ pelada: PeladaSession }>(
+      `/api/peladas/${id}/cancel`,
+      { method: 'POST', body: JSON.stringify({ reason }) },
+      token,
+    );
+    setPeladas((prev) => prev.map((p) => (p.id === id ? res.pelada : p)));
+  }
+
+  async function handleReactivatePelada(id: string) {
+    if (!token) throw new Error('Não autenticado');
+    const res = await apiFetch<{ pelada: PeladaSession }>(
+      `/api/peladas/${id}/reactivate`,
+      { method: 'POST' },
+      token,
+    );
+    setPeladas((prev) => prev.map((p) => (p.id === id ? res.pelada : p)));
+  }
+
+  async function handleToggleRecurringRule(id: string, active: boolean) {
+    if (!token) throw new Error('Não autenticado');
+    await apiFetch(
+      `/api/peladas/recurring/${id}`,
+      { method: 'PUT', body: JSON.stringify({ active }) },
+      token,
+    );
+    await refreshPeladasAndStats();
+  }
+
+  async function handleDeleteRecurringRule(id: string) {
+    if (!token) throw new Error('Não autenticado');
+    await apiFetch(
+      `/api/peladas/recurring/${id}`,
+      { method: 'DELETE' },
+      token,
+    );
+    await refreshPeladasAndStats();
+  }
+
   async function handleToggleAttendance(peladaId: string, playerId?: string) {
     if (!token) throw new Error('Não autenticado');
     const res = await apiFetch<{ pelada: PeladaSession }>(
@@ -235,11 +287,15 @@ export default function App() {
     setPeladas((prev) => prev.map((p) => (p.id === peladaId ? res.pelada : p)));
   }
 
-  async function handleDrawTeams(peladaId: string, teamCount: number) {
+  async function handleDrawTeams(
+    peladaId: string,
+    teamCount: number,
+    playersPerTeam: number,
+  ) {
     if (!token) throw new Error('Não autenticado');
     const res = await apiFetch<{ pelada: PeladaSession }>(
       `/api/peladas/${peladaId}/draw-teams`,
-      { method: 'POST', body: JSON.stringify({ teamCount }) },
+      { method: 'POST', body: JSON.stringify({ teamCount, playersPerTeam }) },
       token,
     );
     setPeladas((prev) => prev.map((p) => (p.id === peladaId ? res.pelada : p)));
@@ -415,10 +471,15 @@ export default function App() {
                 currentUser={currentUser}
                 players={players}
                 peladas={peladas}
+                recurringRules={recurringRules}
                 selectedPeladaId={selectedPeladaId}
                 onSelectPelada={setSelectedPeladaId}
                 onCreatePelada={handleCreatePelada}
                 onDeletePelada={handleDeletePelada}
+                onCancelPelada={handleCancelPelada}
+                onReactivatePelada={handleReactivatePelada}
+                onToggleRecurringRule={handleToggleRecurringRule}
+                onDeleteRecurringRule={handleDeleteRecurringRule}
                 onToggleAttendance={handleToggleAttendance}
                 onDrawTeams={handleDrawTeams}
                 onUpdateTeams={handleUpdateTeams}

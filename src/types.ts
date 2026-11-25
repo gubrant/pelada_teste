@@ -114,7 +114,19 @@ export interface PostMatchVote {
   createdAt: string;
 }
 
-export type PeladaStatus = 'scheduled' | 'live' | 'completed';
+export type PeladaStatus = 'scheduled' | 'live' | 'completed' | 'cancelled';
+
+export interface RecurringPeladaRule {
+  id: string;
+  title: string;
+  dayOfWeek: number; // 0 = Domingo ... 6 = Sábado
+  time: string;
+  location: string;
+  teamCount: number;
+  playersPerTeam: number;
+  active: boolean;
+  createdAt: string;
+}
 
 export interface PeladaSession {
   id: string;
@@ -123,11 +135,18 @@ export interface PeladaSession {
   time: string;
   location: string;
   teamCount: number;
+  playersPerTeam: number;
   status: PeladaStatus;
   presentPlayerIds: string[];
   teams: TeamRoster[];
+  adjustmentNote?: string;
   live: LiveMatchState;
   votes: PostMatchVote[];
+  recurringRuleId?: string;
+  scheduledAt?: string;
+  cancellationReason?: string;
+  cancelledAt?: string;
+  cancelledBy?: string;
   createdAt: string;
 }
 

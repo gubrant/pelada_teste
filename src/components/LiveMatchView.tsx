@@ -63,6 +63,7 @@ export function LiveMatchView({
     peladas.find((p) => p.id === selectedPeladaId) ||
     peladas.find((p) => p.status === 'live') ||
     peladas.find((p) => p.status === 'scheduled') ||
+    peladas.find((p) => p.status !== 'cancelled') ||
     peladas[0] ||
     null;
 
@@ -172,7 +173,15 @@ export function LiveMatchView({
         >
           {peladas.map((p) => (
             <option key={p.id} value={p.id}>
-              {p.title} ({p.status === 'completed' ? 'Concluída' : p.status === 'live' ? 'Ao vivo' : 'Agendada'})
+              {p.title} (
+              {p.status === 'completed'
+                ? 'Concluída'
+                : p.status === 'live'
+                  ? 'Ao vivo'
+                  : p.status === 'cancelled'
+                    ? 'Cancelada'
+                    : 'Agendada'}
+              )
             </option>
           ))}
         </select>
@@ -186,7 +195,9 @@ export function LiveMatchView({
               ? 'Partida em andamento'
               : activePelada.status === 'completed'
                 ? 'Pelada encerrada'
-                : 'Pronta para iniciar'}
+                : activePelada.status === 'cancelled'
+                  ? 'Pelada cancelada'
+                  : 'Pronta para iniciar'}
           </span>
           <span className="font-mono tabular-nums text-base sm:text-lg font-bold text-emerald-400">
             {formatClock(elapsedSeconds)}
@@ -267,7 +278,11 @@ export function LiveMatchView({
         {/* Admin Clock & Match Actions */}
         {isAdmin && (
           <div className="pt-4 border-t border-slate-800 space-y-3">
-            {activePelada.status !== 'completed' ? (
+            {activePelada.status === 'cancelled' ? (
+              <p className="text-xs text-red-300">
+                Esta pelada foi cancelada ({activePelada.cancellationReason || 'Cancelada pela administração'}). Reative na aba Pelada para registrar lances.
+              </p>
+            ) : activePelada.status !== 'completed' ? (
               <>
                 <div className="grid grid-cols-2 sm:grid-cols-3 gap-2.5">
                   <button

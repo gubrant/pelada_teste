@@ -3,6 +3,7 @@ import {
   ArrowUpRight,
   Calendar,
   Check,
+  Clock,
   MapPin,
   Radio,
   Trophy,
@@ -17,6 +18,11 @@ import type {
   PlayerStatsSummary,
 } from '../types';
 import { formatBRL, formatDateBR } from '../utils/api';
+import {
+  formatDeadlineCountdown,
+  formatTimeFromMs,
+  getAttendanceDeadlineMs,
+} from '../utils/peladaTime';
 import { PlayerAvatar } from './PlayerAvatar';
 
 export type AppTab = 'home' | 'pelada' | 'live' | 'players' | 'finance';
@@ -42,11 +48,13 @@ export function HomeDashboard({
 }: HomeDashboardProps) {
   const [heroImgFailed, setHeroImgFailed] = useState(false);
   const [togglingAttendance, setTogglingAttendance] = useState(false);
+  const [attendanceError, setAttendanceError] = useState<string | null>(null);
 
   const activePlayers = players.filter((p) => p.active);
   const nextPelada =
     peladas.find((p) => p.status === 'live') ||
     peladas.find((p) => p.status === 'scheduled') ||
+    peladas.find((p) => p.status !== 'cancelled') ||
     peladas[0];
 
   const completedWithVoting = peladas.find((p) => p.status === 'completed');
@@ -83,11 +91,23 @@ export function HomeDashboard({
     ? nextPelada.presentPlayerIds.includes(currentUser.id)
     : false;
 
+  const deadlineMs = nextPelada ? getAttendanceDeadlineMs(nextPelada) : 0;
+  const deadlinePassed = nextPelada ? Date.now() > deadlineMs : false;
+  const canSelfToggle =
+    Boolean(nextPelada) &&
+    nextPelada?.status === 'scheduled' &&
+    (!deadlinePassed || currentUser.role === 'admin');
+
   async function handleToggleSelfAttendance() {
-    if (!nextPelada || togglingAttendance) return;
+    if (!nextPelada || togglingAttendance || !canSelfToggle) return;
     setTogglingAttendance(true);
+    setAttendanceError(null);
     try {
       await onToggleAttendance(nextPelada.id);
+    } catch (err) {
+      setAttendanceError(
+        err instanceof Error ? err.message : 'Não foi possível confirmar presença.',
+      );
     } finally {
       setTogglingAttendance(false);
     }
@@ -116,7 +136,9 @@ export function HomeDashboard({
                   ? 'Partida em andamento'
                   : nextPelada?.status === 'scheduled'
                     ? 'Próxima pelada agendada'
-                    : 'Resumo da última pelada'}
+                    : nextPelada?.status === 'cancelled'
+                      ? 'Pelada cancelada'
+                      : 'Resumo da última pelada'}
               </span>
               {nextPelada && (
                 <>
@@ -133,15 +155,32 @@ export function HomeDashboard({
             </h1>
 
             {nextPelada && (
-              <div className="mt-2.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-sm text-slate-200">
-                <span className="inline-flex items-center gap-1.5">
-                  <MapPin className="w-4 h-4 text-emerald-400 shrink-0" />
-                  <span>{nextPelada.location}</span>
-                </span>
-                <span className="inline-flex items-center gap-1.5 font-mono tabular-nums">
-                  <Users className="w-4 h-4 text-emerald-400 shrink-0" />
-                  <span>{nextPelada.presentPlayerIds.length} confirmados</span>
-                </span>
+              <div className="mt-2.5 space-y-1.5">
+                <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-sm text-slate-200">
+                  <span className="inline-flex items-center gap-1.5">
+                    <MapPin className="w-4 h-4 text-emerald-400 shrink-0" />
+                    <span>{nextPelada.location}</span>
+                  </span>
+                  <span className="inline-flex items-center gap-1.5 font-mono tabular-nums">
+                    <Users className="w-4 h-4 text-emerald-400 shrink-0" />
+                    <span>{nextPelada.presentPlayerIds.length} confirmados</span>
+                  </span>
+                </div>
+
+                {nextPelada.status === 'scheduled' && (
+                  <p className="text-xs text-amber-200 flex items-center gap-1.5">
+                    <Clock className="w-3.5 h-3.5 shrink-0" />
+                    <span>
+                      {deadlinePassed
+                        ? 'Prazo encerrado (1h antes do jogo) — lista pronta para o sorteio dos times.'
+                        : `Confirme presença até 1h antes do jogo (até ${formatTimeFromMs(deadlineMs)} · ${formatDeadlineCountdown(deadlineMs)}) para entrar no sorteio.`}
+                    </span>
+                  </p>
+                )}
+
+                {attendanceError && (
+                  <p className="text-xs text-red-300">{attendanceError}</p>
+                )}
               </div>
             )}
           </div>
@@ -152,16 +191,22 @@ export function HomeDashboard({
                 <button
                   type="button"
                   onClick={handleToggleSelfAttendance}
-                  disabled={togglingAttendance}
-                  className={`min-h-[44px] px-5 py-2.5 rounded-xl font-semibold text-sm flex items-center gap-2 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                    isAttendingNext
-                      ? 'bg-white text-slate-900 hover:bg-slate-100'
-                      : 'bg-emerald-600 text-white hover:bg-emerald-700'
+                  disabled={togglingAttendance || !canSelfToggle}
+                  className={`min-h-[44px] px-5 py-2.5 rounded-xl font-semibold text-sm flex items-center gap-2 transition-colors whitespace-nowrap shrink-0 ${
+                    !canSelfToggle
+                      ? 'bg-slate-800/80 text-slate-400 cursor-not-allowed'
+                      : isAttendingNext
+                        ? 'bg-white text-slate-900 hover:bg-slate-100 cursor-pointer'
+                        : 'bg-emerald-600 text-white hover:bg-emerald-700 cursor-pointer'
                   }`}
                 >
                   <Check className="w-4 h-4" />
                   <span>
-                    {isAttendingNext ? 'Presença confirmada' : 'Confirmar presença'}
+                    {!canSelfToggle
+                      ? 'Confirmação encerrada'
+                      : isAttendingNext
+                        ? 'Presença confirmada'
+                        : 'Confirmar presença'}
                   </span>
                 </button>
               )}

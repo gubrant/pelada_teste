@@ -11,10 +11,12 @@ import type {
   MatchEventType,
   PeladaSession,
   PlayerStatsSummary,
+  RecurringPeladaRule,
   SkillRatings,
   TeamRoster,
   UserRole,
 } from '../src/types.ts';
+import { getAttendanceDeadlineMs } from '../src/utils/peladaTime.ts';
 import {
   type AuthenticatedRequest,
   createSessionToken,
@@ -29,6 +31,7 @@ import {
   getDb,
   sanitizeUser,
   saveDb,
+  syncRecurringPeladas,
   type StoredUser,
 } from './store.ts';
 
@@ -576,9 +579,84 @@ export function createApp() {
   // Peladas & Matches
   app.get('/api/peladas', requireAuth, (_req, res) => {
     const db = getDb();
+    syncRecurringPeladas(db);
     const peladas = [...db.peladas].sort((a, b) => b.date.localeCompare(a.date));
     const stats = computeStats(db.peladas, db.users);
-    res.json({ peladas, stats });
+    res.json({ peladas, stats, recurringRules: db.recurringRules || [] });
+  });
+
+  app.post('/api/peladas/recurring', requireAuth, requireAdmin, (req, res) => {
+    const body = req.body as Record<string, unknown>;
+    const title = typeof body.title === 'string' && body.title.trim()
+      ? body.title.trim().slice(0, 100)
+      : 'Pelada Fixa · Quadra';
+    const dayOfWeek = Math.max(0, Math.min(6, Number(body.dayOfWeek) || 0));
+    const time = typeof body.time === 'string' && /^\d{2}:\d{2}$/.test(body.time)
+      ? body.time
+      : '20:30';
+    const location = typeof body.location === 'string' && body.location.trim()
+      ? body.location.trim().slice(0, 120)
+      : 'Ginásio Arena Sul — Quadra 1';
+    const teamCount = Math.max(2, Math.min(6, Number(body.teamCount) || 2));
+    const playersPerTeam = Math.max(3, Math.min(10, Number(body.playersPerTeam) || 5));
+
+    const db = getDb();
+    const rule: RecurringPeladaRule = {
+      id: `rec-${crypto.randomUUID().slice(0, 8)}`,
+      title,
+      dayOfWeek,
+      time,
+      location,
+      teamCount,
+      playersPerTeam,
+      active: true,
+      createdAt: new Date().toISOString(),
+    };
+    db.recurringRules.push(rule);
+    syncRecurringPeladas(db);
+    saveDb(db);
+    res.status(201).json({ rule, recurringRules: db.recurringRules });
+  });
+
+  app.put('/api/peladas/recurring/:id', requireAuth, requireAdmin, (req, res) => {
+    const id = String(req.params.id);
+    const db = getDb();
+    const rule = db.recurringRules.find((r) => r.id === id);
+    if (!rule) {
+      res.status(404).json({ error: 'Agendamento fixo não encontrado.' });
+      return;
+    }
+    const body = req.body as Record<string, unknown>;
+    if (typeof body.active === 'boolean') rule.active = body.active;
+    if (typeof body.title === 'string' && body.title.trim()) {
+      rule.title = body.title.trim().slice(0, 100);
+    }
+    if (typeof body.time === 'string' && /^\d{2}:\d{2}$/.test(body.time)) {
+      rule.time = body.time;
+    }
+    if (typeof body.location === 'string' && body.location.trim()) {
+      rule.location = body.location.trim().slice(0, 120);
+    }
+    if (body.dayOfWeek !== undefined) {
+      rule.dayOfWeek = Math.max(0, Math.min(6, Number(body.dayOfWeek) || 0));
+    }
+    if (body.teamCount !== undefined) {
+      rule.teamCount = Math.max(2, Math.min(6, Number(body.teamCount) || 2));
+    }
+    if (body.playersPerTeam !== undefined) {
+      rule.playersPerTeam = Math.max(3, Math.min(10, Number(body.playersPerTeam) || 5));
+    }
+    syncRecurringPeladas(db);
+    saveDb(db);
+    res.json({ rule, recurringRules: db.recurringRules });
+  });
+
+  app.delete('/api/peladas/recurring/:id', requireAuth, requireAdmin, (req, res) => {
+    const id = String(req.params.id);
+    const db = getDb();
+    db.recurringRules = db.recurringRules.filter((r) => r.id !== id);
+    saveDb(db);
+    res.json({ deletedId: id, recurringRules: db.recurringRules });
   });
 
   app.post('/api/peladas', requireAuth, requireAdmin, (req, res) => {
@@ -592,35 +670,64 @@ export function createApp() {
     const time = typeof body.time === 'string' && /^\d{2}:\d{2}$/.test(body.time)
       ? body.time
       : '20:30';
+    const scheduledAt =
+      typeof body.scheduledAt === 'string' && Number.isFinite(Date.parse(body.scheduledAt))
+        ? body.scheduledAt
+        : undefined;
     const location = typeof body.location === 'string' && body.location.trim()
       ? body.location.trim().slice(0, 120)
       : 'Ginásio Arena Sul — Quadra 1';
-    const teamCount = Math.max(2, Math.min(4, Number(body.teamCount) || 2));
+    const teamCount = Math.max(2, Math.min(6, Number(body.teamCount) || 2));
+    const playersPerTeam = Math.max(3, Math.min(10, Number(body.playersPerTeam) || 5));
 
     const db = getDb();
     const activeIds = new Set(db.users.filter((u) => u.active).map((u) => u.id));
     const presentPlayerIds = Array.isArray(body.presentPlayerIds)
       ? body.presentPlayerIds.filter((id): id is string => typeof id === 'string' && activeIds.has(id))
-      : Array.from(activeIds);
+      : [];
 
     const presentPlayers = db.users
       .filter((u) => presentPlayerIds.includes(u.id))
       .map(sanitizeUser);
-    const teams = drawBalancedTeams(presentPlayers, teamCount);
+    const drawResult = drawBalancedTeams(presentPlayers, teamCount, playersPerTeam);
+
+    let recurringRuleId: string | undefined;
+    if (body.isRecurring === true) {
+      const parsedDate = scheduledAt ? new Date(scheduledAt) : new Date(`${date}T${time}:00`);
+      const dayOfWeek = Number.isFinite(parsedDate.getTime())
+        ? parsedDate.getDay()
+        : 2;
+      const rule: RecurringPeladaRule = {
+        id: `rec-${crypto.randomUUID().slice(0, 8)}`,
+        title,
+        dayOfWeek,
+        time,
+        location,
+        teamCount,
+        playersPerTeam,
+        active: true,
+        createdAt: new Date().toISOString(),
+      };
+      db.recurringRules.push(rule);
+      recurringRuleId = rule.id;
+    }
 
     const newPelada: PeladaSession = {
       id: `pel-${crypto.randomUUID().slice(0, 8)}`,
       title,
       date,
       time,
+      scheduledAt,
       location,
       teamCount,
+      playersPerTeam,
       status: 'scheduled',
       presentPlayerIds,
-      teams,
+      teams: drawResult.teams,
+      adjustmentNote: drawResult.adjustmentNote,
       live: {
-        homeTeamId: teams[0]?.id || 'team-a',
-        awayTeamId: teams[1]?.id || 'team-b',
+        homeTeamId: drawResult.teams[0]?.id || 'team-a',
+        awayTeamId: drawResult.teams[1]?.id || 'team-b',
         homeScore: 0,
         awayScore: 0,
         isRunning: false,
@@ -628,12 +735,13 @@ export function createApp() {
         events: [],
       },
       votes: [],
+      recurringRuleId,
       createdAt: new Date().toISOString(),
     };
 
     db.peladas.unshift(newPelada);
     saveDb(db);
-    res.status(201).json({ pelada: newPelada });
+    res.status(201).json({ pelada: newPelada, recurringRules: db.recurringRules });
   });
 
   app.put('/api/peladas/:id', requireAuth, requireAdmin, (req, res) => {
@@ -654,8 +762,11 @@ export function createApp() {
       : current.presentPlayerIds;
 
     const teamCount = body.teamCount !== undefined
-      ? Math.max(2, Math.min(4, Number(body.teamCount) || current.teamCount))
+      ? Math.max(2, Math.min(6, Number(body.teamCount) || current.teamCount))
       : current.teamCount;
+    const playersPerTeam = body.playersPerTeam !== undefined
+      ? Math.max(3, Math.min(10, Number(body.playersPerTeam) || current.playersPerTeam || 5))
+      : (current.playersPerTeam || 5);
 
     const updated: PeladaSession = {
       ...current,
@@ -672,6 +783,7 @@ export function createApp() {
         ? body.location.trim().slice(0, 120)
         : current.location,
       teamCount,
+      playersPerTeam,
       presentPlayerIds,
     };
 
@@ -690,6 +802,57 @@ export function createApp() {
     db.peladas = db.peladas.filter((p) => p.id !== id);
     saveDb(db);
     res.json({ deletedId: id });
+  });
+
+  app.post('/api/peladas/:id/cancel', requireAuth, requireAdmin, (req: AuthenticatedRequest, res) => {
+    const id = String(req.params.id);
+    const db = getDb();
+    const pelada = db.peladas.find((p) => p.id === id);
+    if (!pelada) {
+      res.status(404).json({ error: 'Pelada não encontrada.' });
+      return;
+    }
+    if (pelada.status === 'completed') {
+      res.status(400).json({ error: 'Não é possível cancelar uma pelada já concluída.' });
+      return;
+    }
+
+    const reason =
+      typeof req.body?.reason === 'string' && req.body.reason.trim()
+        ? req.body.reason.trim().slice(0, 200)
+        : 'Cancelada pela administração';
+
+    pelada.status = 'cancelled';
+    pelada.live.isRunning = false;
+    pelada.live.lastStartedAt = undefined;
+    pelada.cancellationReason = reason;
+    pelada.cancelledAt = new Date().toISOString();
+    pelada.cancelledBy = req.session?.sub;
+
+    saveDb(db);
+    res.json({ pelada });
+  });
+
+  app.post('/api/peladas/:id/reactivate', requireAuth, requireAdmin, (req, res) => {
+    const id = String(req.params.id);
+    const db = getDb();
+    const pelada = db.peladas.find((p) => p.id === id);
+    if (!pelada) {
+      res.status(404).json({ error: 'Pelada não encontrada.' });
+      return;
+    }
+    if (pelada.status !== 'cancelled') {
+      res.status(400).json({ error: 'Apenas peladas canceladas podem ser reativadas.' });
+      return;
+    }
+
+    pelada.status = 'scheduled';
+    pelada.cancellationReason = undefined;
+    pelada.cancelledAt = undefined;
+    pelada.cancelledBy = undefined;
+
+    saveDb(db);
+    res.json({ pelada });
   });
 
   app.post('/api/peladas/:id/attendance', requireAuth, (req: AuthenticatedRequest, res) => {
@@ -711,8 +874,20 @@ export function createApp() {
       res.status(404).json({ error: 'Pelada não encontrada.' });
       return;
     }
+    if (pelada.status === 'cancelled') {
+      res.status(400).json({ error: 'Esta pelada foi cancelada pela administração.' });
+      return;
+    }
     if (pelada.status === 'completed') {
       res.status(400).json({ error: 'Pelada já concluída.' });
+      return;
+    }
+
+    const deadlineMs = getAttendanceDeadlineMs(pelada);
+    if (!isAdmin && Date.now() > deadlineMs) {
+      res.status(400).json({
+        error: 'O prazo de confirmação encerrou 1 hora antes do início da pelada para o sorteio dos times.',
+      });
       return;
     }
 
@@ -738,17 +913,27 @@ export function createApp() {
       res.status(404).json({ error: 'Pelada não encontrada.' });
       return;
     }
+    if (pelada.status === 'cancelled') {
+      res.status(400).json({ error: 'Pelada cancelada não pode ter times sorteados.' });
+      return;
+    }
 
     const teamCount = req.body?.teamCount !== undefined
-      ? Math.max(2, Math.min(4, Number(req.body.teamCount) || pelada.teamCount))
+      ? Math.max(2, Math.min(6, Number(req.body.teamCount) || pelada.teamCount))
       : pelada.teamCount;
+    const playersPerTeam = req.body?.playersPerTeam !== undefined
+      ? Math.max(3, Math.min(10, Number(req.body.playersPerTeam) || pelada.playersPerTeam || 5))
+      : (pelada.playersPerTeam || 5);
 
     pelada.teamCount = teamCount;
+    pelada.playersPerTeam = playersPerTeam;
     const presentPlayers = db.users
       .filter((u) => u.active && pelada.presentPlayerIds.includes(u.id))
       .map(sanitizeUser);
 
-    pelada.teams = drawBalancedTeams(presentPlayers, teamCount);
+    const drawResult = drawBalancedTeams(presentPlayers, teamCount, playersPerTeam);
+    pelada.teams = drawResult.teams;
+    pelada.adjustmentNote = drawResult.adjustmentNote;
     pelada.live.homeTeamId = pelada.teams[0]?.id || 'team-a';
     pelada.live.awayTeamId = pelada.teams[1]?.id || 'team-b';
 
@@ -762,6 +947,10 @@ export function createApp() {
     const pelada = db.peladas.find((p) => p.id === id);
     if (!pelada) {
       res.status(404).json({ error: 'Pelada não encontrada.' });
+      return;
+    }
+    if (pelada.status === 'cancelled') {
+      res.status(400).json({ error: 'Pelada cancelada.' });
       return;
     }
 
@@ -807,6 +996,10 @@ export function createApp() {
     const pelada = db.peladas.find((p) => p.id === id);
     if (!pelada) {
       res.status(404).json({ error: 'Pelada não encontrada.' });
+      return;
+    }
+    if (pelada.status === 'cancelled') {
+      res.status(400).json({ error: 'Esta pelada foi cancelada.' });
       return;
     }
 
@@ -879,6 +1072,10 @@ export function createApp() {
     const pelada = db.peladas.find((p) => p.id === id);
     if (!pelada) {
       res.status(404).json({ error: 'Pelada não encontrada.' });
+      return;
+    }
+    if (pelada.status === 'cancelled') {
+      res.status(400).json({ error: 'Esta pelada foi cancelada.' });
       return;
     }
 

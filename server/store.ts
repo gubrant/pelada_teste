@@ -1,9 +1,11 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import type {
   FinanceEntry,
   PeladaSession,
   PlayerProfile,
+  RecurringPeladaRule,
   SkillRatings,
   TeamColor,
   TeamRoster,
@@ -19,6 +21,7 @@ export interface AppDatabase {
   users: StoredUser[];
   finance: FinanceEntry[];
   peladas: PeladaSession[];
+  recurringRules: RecurringPeladaRule[];
 }
 
 export function computeFinalRating(skills: SkillRatings): number {
@@ -36,13 +39,28 @@ export function sanitizeUser(user: StoredUser): PlayerProfile {
   return safe;
 }
 
+export interface DrawResult {
+  teams: TeamRoster[];
+  effectiveTeamCount: number;
+  adjustmentNote?: string;
+}
+
 export function drawBalancedTeams(
   players: PlayerProfile[],
   teamCount: number,
-): TeamRoster[] {
-  const count = Math.max(2, Math.min(4, Math.floor(teamCount) || 2));
-  const labels = ['Time A', 'Time B', 'Time C', 'Time D'];
-  const colors: TeamColor[] = ['emerald', 'amber', 'slate', 'rose'];
+  playersPerTeam = 5,
+): DrawResult {
+  const requestedTeams = Math.max(2, Math.min(6, Math.floor(teamCount) || 2));
+  const perTeam = Math.max(3, Math.min(10, Math.floor(playersPerTeam) || 5));
+
+  // If too few players to put at least 2 on every requested team, adjust team count down automatically
+  let effectiveTeamCount = requestedTeams;
+  if (players.length >= 4 && players.length < requestedTeams * 2) {
+    effectiveTeamCount = Math.max(2, Math.floor(players.length / 2));
+  }
+
+  const labels = ['Time A', 'Time B', 'Time C', 'Time D', 'Time E', 'Time F'];
+  const colors: TeamColor[] = ['emerald', 'amber', 'slate', 'rose', 'emerald', 'amber'];
 
   const teams: {
     id: string;
@@ -50,7 +68,7 @@ export function drawBalancedTeams(
     color: TeamColor;
     playerIds: string[];
     ratingSum: number;
-  }[] = Array.from({ length: count }, (_, idx) => ({
+  }[] = Array.from({ length: effectiveTeamCount }, (_, idx) => ({
     id: `team-${String.fromCharCode(97 + idx)}`,
     name: labels[idx],
     color: colors[idx],
@@ -88,12 +106,33 @@ export function drawBalancedTeams(
   goalkeepers.forEach(assignPlayer);
   outfielders.forEach(assignPlayer);
 
-  return teams.map(({ id, name, color, playerIds }) => ({
-    id,
-    name,
-    color,
-    playerIds,
-  }));
+  const expectedTotal = requestedTeams * perTeam;
+  let adjustmentNote: string | undefined;
+
+  if (players.length > 0) {
+    const countsSummary = teams
+      .map((t) => `${t.name} (${t.playerIds.length})`)
+      .join(', ');
+
+    if (effectiveTeamCount !== requestedTeams) {
+      adjustmentNote = `Apenas ${players.length} confirmados para ${requestedTeams} times de ${perTeam}. Ajuste automático para ${effectiveTeamCount} times: ${countsSummary}.`;
+    } else if (players.length < expectedTotal) {
+      adjustmentNote = `${players.length} confirmados para ${expectedTotal} vagas (${requestedTeams}×${perTeam}). Ajuste automático aplicado: ${countsSummary}.`;
+    } else if (players.length > expectedTotal) {
+      adjustmentNote = `${players.length} confirmados superam ${expectedTotal} vagas (${requestedTeams}×${perTeam}). Todos foram distribuídos: ${countsSummary}.`;
+    }
+  }
+
+  return {
+    teams: teams.map(({ id, name, color, playerIds }) => ({
+      id,
+      name,
+      color,
+      playerIds,
+    })),
+    effectiveTeamCount,
+    adjustmentNote,
+  };
 }
 
 function resolveDataFile(): string {
@@ -448,7 +487,6 @@ function createInitialSeed(): AppDatabase {
 
   const safeProfiles = users.map(sanitizeUser);
   const allIds = safeProfiles.map((u) => u.id);
-  const scheduledTeams = drawBalancedTeams(safeProfiles, 2);
 
   const completedPeladaTeams: TeamRoster[] = [
     {
@@ -465,17 +503,40 @@ function createInitialSeed(): AppDatabase {
     },
   ];
 
-  const peladas: PeladaSession[] = [
+  const nextMatchDateObj = new Date(Date.now() + 4 * 60 * 60 * 1000);
+  const nextDateStr = `${nextMatchDateObj.getFullYear()}-${String(nextMatchDateObj.getMonth() + 1).padStart(2, '0')}-${String(nextMatchDateObj.getDate()).padStart(2, '0')}`;
+  const nextTimeStr = `${String(nextMatchDateObj.getHours()).padStart(2, '0')}:${String(nextMatchDateObj.getMinutes()).padStart(2, '0')}`;
+
+  const recurringRules: RecurringPeladaRule[] = [
     {
-      id: 'pel-today',
-      title: 'Pelada de Terça · Arena Sul',
-      date: formatDateOffset(0),
+      id: 'rec-terca',
+      title: 'Pelada Fixa · Arena Sul',
+      dayOfWeek: 2, // Terça-feira
       time: '20:30',
       location: 'Ginásio Arena Sul — Quadra 1',
       teamCount: 2,
+      playersPerTeam: 5,
+      active: true,
+      createdAt: new Date().toISOString(),
+    },
+  ];
+
+  const todayDraw = drawBalancedTeams(safeProfiles.slice(0, 8), 2, 5);
+
+  const peladas: PeladaSession[] = [
+    {
+      id: 'pel-today',
+      title: 'Pelada de Hoje · Arena Sul',
+      date: nextDateStr,
+      time: nextTimeStr,
+      scheduledAt: nextMatchDateObj.toISOString(),
+      location: 'Ginásio Arena Sul — Quadra 1',
+      teamCount: 2,
+      playersPerTeam: 5,
       status: 'scheduled',
-      presentPlayerIds: allIds,
-      teams: scheduledTeams,
+      presentPlayerIds: allIds.slice(0, 8),
+      teams: todayDraw.teams,
+      adjustmentNote: todayDraw.adjustmentNote,
       live: {
         homeTeamId: 'team-a',
         awayTeamId: 'team-b',
@@ -495,6 +556,7 @@ function createInitialSeed(): AppDatabase {
       time: '20:30',
       location: 'Ginásio Arena Sul — Quadra 1',
       teamCount: 2,
+      playersPerTeam: 5,
       status: 'completed',
       presentPlayerIds: allIds,
       teams: completedPeladaTeams,
@@ -570,7 +632,80 @@ function createInitialSeed(): AppDatabase {
     },
   ];
 
-  return { users, finance, peladas };
+  return { users, finance, peladas, recurringRules };
+}
+
+export function getNextOccurrenceForRule(rule: RecurringPeladaRule): {
+  date: string;
+  scheduledAt: string;
+} {
+  const [hh, mm] = rule.time.split(':').map((n) => Number(n) || 0);
+  const now = new Date();
+  const candidate = new Date(now);
+  candidate.setHours(hh, mm, 0, 0);
+
+  const currentDow = candidate.getDay();
+  let daysAhead = (rule.dayOfWeek - currentDow + 7) % 7;
+  if (daysAhead === 0 && candidate.getTime() <= now.getTime()) {
+    daysAhead = 7;
+  }
+  candidate.setDate(candidate.getDate() + daysAhead);
+
+  const date = `${candidate.getFullYear()}-${String(candidate.getMonth() + 1).padStart(2, '0')}-${String(candidate.getDate()).padStart(2, '0')}`;
+  return { date, scheduledAt: candidate.toISOString() };
+}
+
+export function syncRecurringPeladas(db: AppDatabase): boolean {
+  if (!Array.isArray(db.recurringRules)) {
+    db.recurringRules = [];
+  }
+  let changed = false;
+
+  for (const rule of db.recurringRules) {
+    if (!rule.active) continue;
+    const { date, scheduledAt } = getNextOccurrenceForRule(rule);
+
+    // Do not duplicate if already created (even if cancelled/completed/live) for that date & rule or same date+time
+    const alreadyExists = db.peladas.some(
+      (p) =>
+        (p.recurringRuleId === rule.id && p.date === date) ||
+        (p.date === date && p.time === rule.time && p.title === rule.title),
+    );
+    if (alreadyExists) continue;
+
+    const emptyDraw = drawBalancedTeams([], rule.teamCount, rule.playersPerTeam || 5);
+    db.peladas.unshift({
+      id: `pel-${crypto.randomUUID().slice(0, 8)}`,
+      title: rule.title,
+      date,
+      time: rule.time,
+      scheduledAt,
+      location: rule.location,
+      teamCount: rule.teamCount,
+      playersPerTeam: rule.playersPerTeam || 5,
+      status: 'scheduled',
+      presentPlayerIds: [],
+      teams: emptyDraw.teams,
+      live: {
+        homeTeamId: emptyDraw.teams[0]?.id || 'team-a',
+        awayTeamId: emptyDraw.teams[1]?.id || 'team-b',
+        homeScore: 0,
+        awayScore: 0,
+        isRunning: false,
+        elapsedSeconds: 0,
+        events: [],
+      },
+      votes: [],
+      recurringRuleId: rule.id,
+      createdAt: new Date().toISOString(),
+    });
+    changed = true;
+  }
+
+  if (changed) {
+    saveDb(db);
+  }
+  return changed;
 }
 
 let memoryDb: AppDatabase | null = null;
@@ -583,7 +718,17 @@ export function getDb(): AppDatabase {
       const raw = fs.readFileSync(dataFilePath, 'utf8');
       const parsed = JSON.parse(raw) as AppDatabase;
       if (parsed && Array.isArray(parsed.users) && parsed.users.length > 0) {
+        if (!Array.isArray(parsed.recurringRules)) {
+          parsed.recurringRules = [];
+        }
+        for (const r of parsed.recurringRules) {
+          if (!r.playersPerTeam) r.playersPerTeam = 5;
+        }
+        for (const p of parsed.peladas) {
+          if (!p.playersPerTeam) p.playersPerTeam = 5;
+        }
         memoryDb = parsed;
+        syncRecurringPeladas(memoryDb);
         return memoryDb;
       }
     }
@@ -592,6 +737,7 @@ export function getDb(): AppDatabase {
   }
 
   memoryDb = createInitialSeed();
+  syncRecurringPeladas(memoryDb);
   saveDb(memoryDb);
   return memoryDb;
 }
