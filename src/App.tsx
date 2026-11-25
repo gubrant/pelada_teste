@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
+  ArrowLeft,
   CalendarDays,
   Home,
   LogOut,
@@ -11,18 +12,22 @@ import { FinanceView } from './components/FinanceView';
 import { HomeDashboard, type AppTab } from './components/HomeDashboard';
 import { LiveMatchView } from './components/LiveMatchView';
 import { LoginScreen } from './components/LoginScreen';
+import { PeladaHubView } from './components/PeladaHubView';
 import { PeladasView } from './components/PeladasView';
 import { PlayersView } from './components/PlayersView';
 import type {
+  AvailableUserOption,
   FinanceCategory,
   FinanceEntry,
   FinanceType,
+  GroupSummary,
   MatchEventType,
+  PeladaGroup,
   PeladaSession,
   PlayerProfile,
   PlayerStatsSummary,
-  RecurringPeladaRule,
   TeamRoster,
+  UserRole,
 } from './types';
 import { ApiError, apiFetch } from './utils/api';
 
@@ -34,150 +39,276 @@ const NAV_ITEMS: { id: AppTab; label: string; icon: typeof Home }[] = [
   { id: 'finance', label: 'Caixa', icon: Wallet },
 ];
 
+interface WorkspaceResponse {
+  group: PeladaGroup;
+  members: PlayerProfile[];
+  availableUsers: AvailableUserOption[];
+  finance: FinanceEntry[];
+  peladas: PeladaSession[];
+  stats: Record<string, PlayerStatsSummary>;
+}
+
 export default function App() {
   const [token, setToken] = useState<string | null>(null);
-  const [currentUser, setCurrentUser] = useState<PlayerProfile | null>(null);
-  const [activeTab, setActiveTab] = useState<AppTab>('home');
-  const [selectedPeladaId, setSelectedPeladaId] = useState<string | null>(null);
+  const [globalUser, setGlobalUser] = useState<PlayerProfile | null>(null);
 
-  const [players, setPlayers] = useState<PlayerProfile[]>([]);
+  // Hub state (first page after login: list of fixed peladas)
+  const [viewMode, setViewMode] = useState<'hub' | 'workspace'>('hub');
+  const [groups, setGroups] = useState<GroupSummary[]>([]);
+  const [loadingGroups, setLoadingGroups] = useState(false);
+
+  // Active pelada group workspace state
+  const [activeGroup, setActiveGroup] = useState<PeladaGroup | null>(null);
+  const [members, setMembers] = useState<PlayerProfile[]>([]);
+  const [availableUsers, setAvailableUsers] = useState<AvailableUserOption[]>([]);
   const [finance, setFinance] = useState<FinanceEntry[]>([]);
   const [peladas, setPeladas] = useState<PeladaSession[]>([]);
-  const [recurringRules, setRecurringRules] = useState<RecurringPeladaRule[]>([]);
   const [stats, setStats] = useState<Record<string, PlayerStatsSummary>>({});
-  const [loadingData, setLoadingData] = useState(false);
+  const [loadingWorkspace, setLoadingWorkspace] = useState(false);
+
+  const [activeTab, setActiveTab] = useState<AppTab>('home');
+  const [selectedPeladaId, setSelectedPeladaId] = useState<string | null>(null);
   const [globalError, setGlobalError] = useState<string | null>(null);
+
+  const workspaceUser = useMemo(() => {
+    if (!globalUser) return null;
+    return members.find((m) => m.id === globalUser.id) || globalUser;
+  }, [globalUser, members]);
 
   const handleLogout = useCallback(() => {
     setToken(null);
-    setCurrentUser(null);
-    setPlayers([]);
+    setGlobalUser(null);
+    setViewMode('hub');
+    setGroups([]);
+    setActiveGroup(null);
+    setMembers([]);
+    setAvailableUsers([]);
     setFinance([]);
     setPeladas([]);
-    setRecurringRules([]);
     setStats({});
     setSelectedPeladaId(null);
     setActiveTab('home');
     setGlobalError(null);
   }, []);
 
-  const loadAllData = useCallback(
+  const applyWorkspace = useCallback((ws: WorkspaceResponse) => {
+    setActiveGroup(ws.group);
+    setMembers(ws.members);
+    setAvailableUsers(ws.availableUsers);
+    setFinance(ws.finance);
+    setPeladas(ws.peladas);
+    setStats(ws.stats);
+    setSelectedPeladaId((prev) => {
+      if (prev && ws.peladas.some((p) => p.id === prev)) return prev;
+      return ws.peladas[0]?.id || null;
+    });
+  }, []);
+
+  const loadGroupsList = useCallback(
     async (authToken: string) => {
-      setLoadingData(true);
+      setLoadingGroups(true);
       setGlobalError(null);
       try {
-        const [meRes, playersRes, financeRes, peladasRes] = await Promise.all([
+        const [meRes, groupsRes] = await Promise.all([
           apiFetch<{ user: PlayerProfile }>('/api/auth/me', {}, authToken),
-          apiFetch<{ players: PlayerProfile[] }>('/api/players', {}, authToken),
-          apiFetch<{ entries: FinanceEntry[] }>('/api/finance', {}, authToken),
-          apiFetch<{
-            peladas: PeladaSession[];
-            stats: Record<string, PlayerStatsSummary>;
-            recurringRules: RecurringPeladaRule[];
-          }>('/api/peladas', {}, authToken),
+          apiFetch<{ groups: GroupSummary[] }>('/api/groups', {}, authToken),
         ]);
-
-        setCurrentUser(meRes.user);
-        setPlayers(playersRes.players);
-        setFinance(financeRes.entries);
-        setPeladas(peladasRes.peladas);
-        setRecurringRules(peladasRes.recurringRules || []);
-        setStats(peladasRes.stats);
-        setSelectedPeladaId((prev) => {
-          if (prev && peladasRes.peladas.some((p) => p.id === prev)) return prev;
-          return peladasRes.peladas[0]?.id || null;
-        });
+        setGlobalUser(meRes.user);
+        setGroups(groupsRes.groups);
       } catch (err) {
         if (err instanceof ApiError && err.status === 401) {
           handleLogout();
         } else {
           setGlobalError(
-            err instanceof Error ? err.message : 'Erro ao carregar dados.',
+            err instanceof Error ? err.message : 'Erro ao carregar peladas.',
           );
         }
       } finally {
-        setLoadingData(false);
+        setLoadingGroups(false);
       }
     },
     [handleLogout],
   );
 
-  // Auto-refresh pelada state every 4s while viewing the Live tab
+  const openGroupWorkspace = useCallback(
+    async (groupId: string, authTokenOverride?: string) => {
+      const authToken = authTokenOverride || token;
+      if (!authToken) return;
+      setLoadingWorkspace(true);
+      setGlobalError(null);
+      try {
+        const ws = await apiFetch<WorkspaceResponse>(
+          `/api/groups/${groupId}`,
+          {},
+          authToken,
+        );
+        applyWorkspace(ws);
+        setActiveTab('home');
+        setViewMode('workspace');
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+      } catch (err) {
+        if (err instanceof ApiError && err.status === 401) {
+          handleLogout();
+        } else {
+          setGlobalError(
+            err instanceof Error ? err.message : 'Erro ao abrir pelada.',
+          );
+        }
+      } finally {
+        setLoadingWorkspace(false);
+      }
+    },
+    [token, applyWorkspace, handleLogout],
+  );
+
+  const refreshActiveWorkspace = useCallback(async () => {
+    if (!token || !activeGroup) return;
+    const ws = await apiFetch<WorkspaceResponse>(
+      `/api/groups/${activeGroup.id}`,
+      {},
+      token,
+    );
+    applyWorkspace(ws);
+  }, [token, activeGroup, applyWorkspace]);
+
+  // Auto-refresh active pelada workspace every 4s while viewing Ao Vivo
   useEffect(() => {
-    if (!token || activeTab !== 'live') return;
+    if (!token || viewMode !== 'workspace' || activeTab !== 'live' || !activeGroup) {
+      return;
+    }
     const interval = window.setInterval(async () => {
       try {
-        const res = await apiFetch<{
-          peladas: PeladaSession[];
-          stats: Record<string, PlayerStatsSummary>;
-          recurringRules: RecurringPeladaRule[];
-        }>('/api/peladas', {}, token);
-        setPeladas(res.peladas);
-        setRecurringRules(res.recurringRules || []);
-        setStats(res.stats);
+        const ws = await apiFetch<WorkspaceResponse>(
+          `/api/groups/${activeGroup.id}`,
+          {},
+          token,
+        );
+        applyWorkspace(ws);
       } catch {
         // Silent background refresh
       }
     }, 4000);
     return () => window.clearInterval(interval);
-  }, [token, activeTab]);
-
-  async function refreshPeladasAndStats() {
-    if (!token) return;
-    const res = await apiFetch<{
-      peladas: PeladaSession[];
-      stats: Record<string, PlayerStatsSummary>;
-      recurringRules: RecurringPeladaRule[];
-    }>('/api/peladas', {}, token);
-    setPeladas(res.peladas);
-    setRecurringRules(res.recurringRules || []);
-    setStats(res.stats);
-  }
+  }, [token, viewMode, activeTab, activeGroup, applyWorkspace]);
 
   async function handleLoginSuccess(newToken: string, user: PlayerProfile) {
     setToken(newToken);
-    setCurrentUser(user);
-    await loadAllData(newToken);
+    setGlobalUser(user);
+    setViewMode('hub');
+    await loadGroupsList(newToken);
   }
 
-  // Player mutations
-  async function handleCreatePlayer(payload: Record<string, unknown>) {
+  async function handleReturnToHub() {
+    setViewMode('hub');
+    setActiveGroup(null);
+    setSelectedPeladaId(null);
+    setActiveTab('home');
+    if (token) {
+      await loadGroupsList(token);
+    }
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+
+  // Hub actions
+  async function handleCreateGroup(payload: {
+    name: string;
+    description: string;
+    dayOfWeek: number;
+    time: string;
+    location: string;
+    teamCount: number;
+    playersPerTeam: number;
+    autoSchedule: boolean;
+  }) {
     if (!token) throw new Error('Não autenticado');
-    const res = await apiFetch<{ player: PlayerProfile }>(
-      '/api/players',
+    const res = await apiFetch<{ group: PeladaGroup }>(
+      '/api/groups',
       { method: 'POST', body: JSON.stringify(payload) },
       token,
     );
-    setPlayers((prev) => [...prev, res.player]);
-    return res.player;
+    await loadGroupsList(token);
+    await openGroupWorkspace(res.group.id, token);
   }
 
-  async function handleUpdatePlayer(id: string, payload: Record<string, unknown>) {
+  async function handleJoinGroup(groupId: string) {
     if (!token) throw new Error('Não autenticado');
-    const res = await apiFetch<{ player: PlayerProfile }>(
-      `/api/players/${id}`,
+    const res = await apiFetch<{ workspace: WorkspaceResponse }>(
+      `/api/groups/${groupId}/join`,
+      { method: 'POST' },
+      token,
+    );
+    applyWorkspace(res.workspace);
+    setActiveTab('home');
+    setViewMode('workspace');
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+
+  async function handleUpdateGroup(payload: Record<string, unknown>) {
+    if (!token || !activeGroup) throw new Error('Não autenticado');
+    const ws = await apiFetch<WorkspaceResponse>(
+      `/api/groups/${activeGroup.id}`,
       { method: 'PUT', body: JSON.stringify(payload) },
       token,
     );
-    setPlayers((prev) => prev.map((p) => (p.id === id ? res.player : p)));
-    if (currentUser?.id === id) {
-      setCurrentUser(res.player);
-    }
-    return res.player;
+    applyWorkspace(ws);
   }
 
-  async function handleDeletePlayer(id: string) {
-    if (!token) throw new Error('Não autenticado');
+  async function handleDeleteGroup() {
+    if (!token || !activeGroup) throw new Error('Não autenticado');
     await apiFetch<{ deletedId: string }>(
-      `/api/players/${id}`,
+      `/api/groups/${activeGroup.id}`,
       { method: 'DELETE' },
       token,
     );
-    setPlayers((prev) => prev.filter((p) => p.id !== id));
-    await refreshPeladasAndStats();
+    await handleReturnToHub();
   }
 
-  // Finance mutations
+  // Member mutations scoped to activeGroup
+  async function handleAddExistingMember(existingUserId: string, role: UserRole) {
+    if (!token || !activeGroup) throw new Error('Não autenticado');
+    const ws = await apiFetch<WorkspaceResponse>(
+      `/api/groups/${activeGroup.id}/members`,
+      { method: 'POST', body: JSON.stringify({ existingUserId, role }) },
+      token,
+    );
+    applyWorkspace(ws);
+  }
+
+  async function handleCreatePlayer(payload: Record<string, unknown>) {
+    if (!token || !activeGroup) throw new Error('Não autenticado');
+    const ws = await apiFetch<WorkspaceResponse>(
+      `/api/groups/${activeGroup.id}/members`,
+      { method: 'POST', body: JSON.stringify(payload) },
+      token,
+    );
+    applyWorkspace(ws);
+  }
+
+  async function handleUpdatePlayer(id: string, payload: Record<string, unknown>) {
+    if (!token || !activeGroup) throw new Error('Não autenticado');
+    const ws = await apiFetch<WorkspaceResponse>(
+      `/api/groups/${activeGroup.id}/members/${id}`,
+      { method: 'PUT', body: JSON.stringify(payload) },
+      token,
+    );
+    applyWorkspace(ws);
+    if (globalUser?.id === id) {
+      const me = await apiFetch<{ user: PlayerProfile }>('/api/auth/me', {}, token);
+      setGlobalUser(me.user);
+    }
+  }
+
+  async function handleDeletePlayer(id: string) {
+    if (!token || !activeGroup) throw new Error('Não autenticado');
+    const ws = await apiFetch<WorkspaceResponse>(
+      `/api/groups/${activeGroup.id}/members/${id}`,
+      { method: 'DELETE' },
+      token,
+    );
+    applyWorkspace(ws);
+  }
+
+  // Finance mutations scoped to activeGroup
   async function handleCreateFinance(payload: {
     type: FinanceType;
     date: string;
@@ -186,9 +317,9 @@ export default function App() {
     amount: number;
     receiptUrl?: string;
   }) {
-    if (!token) throw new Error('Não autenticado');
+    if (!token || !activeGroup) throw new Error('Não autenticado');
     const res = await apiFetch<{ entry: FinanceEntry }>(
-      '/api/finance',
+      `/api/groups/${activeGroup.id}/finance`,
       { method: 'POST', body: JSON.stringify(payload) },
       token,
     );
@@ -196,16 +327,16 @@ export default function App() {
   }
 
   async function handleDeleteFinance(id: string) {
-    if (!token) throw new Error('Não autenticado');
+    if (!token || !activeGroup) throw new Error('Não autenticado');
     await apiFetch<{ deletedId: string }>(
-      `/api/finance/${id}`,
+      `/api/groups/${activeGroup.id}/finance/${id}`,
       { method: 'DELETE' },
       token,
     );
     setFinance((prev) => prev.filter((f) => f.id !== id));
   }
 
-  // Pelada mutations
+  // Match session mutations scoped to activeGroup
   async function handleCreatePelada(payload: {
     title: string;
     date: string;
@@ -215,32 +346,31 @@ export default function App() {
     teamCount: number;
     playersPerTeam: number;
     presentPlayerIds: string[];
-    isRecurring?: boolean;
   }) {
-    if (!token) throw new Error('Não autenticado');
+    if (!token || !activeGroup) throw new Error('Não autenticado');
     const res = await apiFetch<{ pelada: PeladaSession }>(
-      '/api/peladas',
+      `/api/groups/${activeGroup.id}/peladas`,
       { method: 'POST', body: JSON.stringify(payload) },
       token,
     );
-    await refreshPeladasAndStats();
+    await refreshActiveWorkspace();
     return res.pelada;
   }
 
   async function handleDeletePelada(id: string) {
-    if (!token) throw new Error('Não autenticado');
+    if (!token || !activeGroup) throw new Error('Não autenticado');
     await apiFetch<{ deletedId: string }>(
-      `/api/peladas/${id}`,
+      `/api/groups/${activeGroup.id}/peladas/${id}`,
       { method: 'DELETE' },
       token,
     );
-    await refreshPeladasAndStats();
+    await refreshActiveWorkspace();
   }
 
   async function handleCancelPelada(id: string, reason?: string) {
-    if (!token) throw new Error('Não autenticado');
+    if (!token || !activeGroup) throw new Error('Não autenticado');
     const res = await apiFetch<{ pelada: PeladaSession }>(
-      `/api/peladas/${id}/cancel`,
+      `/api/groups/${activeGroup.id}/peladas/${id}/cancel`,
       { method: 'POST', body: JSON.stringify({ reason }) },
       token,
     );
@@ -248,39 +378,19 @@ export default function App() {
   }
 
   async function handleReactivatePelada(id: string) {
-    if (!token) throw new Error('Não autenticado');
+    if (!token || !activeGroup) throw new Error('Não autenticado');
     const res = await apiFetch<{ pelada: PeladaSession }>(
-      `/api/peladas/${id}/reactivate`,
+      `/api/groups/${activeGroup.id}/peladas/${id}/reactivate`,
       { method: 'POST' },
       token,
     );
     setPeladas((prev) => prev.map((p) => (p.id === id ? res.pelada : p)));
   }
 
-  async function handleToggleRecurringRule(id: string, active: boolean) {
-    if (!token) throw new Error('Não autenticado');
-    await apiFetch(
-      `/api/peladas/recurring/${id}`,
-      { method: 'PUT', body: JSON.stringify({ active }) },
-      token,
-    );
-    await refreshPeladasAndStats();
-  }
-
-  async function handleDeleteRecurringRule(id: string) {
-    if (!token) throw new Error('Não autenticado');
-    await apiFetch(
-      `/api/peladas/recurring/${id}`,
-      { method: 'DELETE' },
-      token,
-    );
-    await refreshPeladasAndStats();
-  }
-
   async function handleToggleAttendance(peladaId: string, playerId?: string) {
-    if (!token) throw new Error('Não autenticado');
+    if (!token || !activeGroup) throw new Error('Não autenticado');
     const res = await apiFetch<{ pelada: PeladaSession }>(
-      `/api/peladas/${peladaId}/attendance`,
+      `/api/groups/${activeGroup.id}/peladas/${peladaId}/attendance`,
       { method: 'POST', body: JSON.stringify(playerId ? { playerId } : {}) },
       token,
     );
@@ -292,9 +402,9 @@ export default function App() {
     teamCount: number,
     playersPerTeam: number,
   ) {
-    if (!token) throw new Error('Não autenticado');
+    if (!token || !activeGroup) throw new Error('Não autenticado');
     const res = await apiFetch<{ pelada: PeladaSession }>(
-      `/api/peladas/${peladaId}/draw-teams`,
+      `/api/groups/${activeGroup.id}/peladas/${peladaId}/draw-teams`,
       { method: 'POST', body: JSON.stringify({ teamCount, playersPerTeam }) },
       token,
     );
@@ -302,9 +412,9 @@ export default function App() {
   }
 
   async function handleUpdateTeams(peladaId: string, teams: TeamRoster[]) {
-    if (!token) throw new Error('Não autenticado');
+    if (!token || !activeGroup) throw new Error('Não autenticado');
     const res = await apiFetch<{ pelada: PeladaSession }>(
-      `/api/peladas/${peladaId}/teams`,
+      `/api/groups/${activeGroup.id}/peladas/${peladaId}/teams`,
       { method: 'PUT', body: JSON.stringify({ teams }) },
       token,
     );
@@ -315,14 +425,14 @@ export default function App() {
     peladaId: string,
     payload: Record<string, unknown>,
   ) {
-    if (!token) throw new Error('Não autenticado');
+    if (!token || !activeGroup) throw new Error('Não autenticado');
     const res = await apiFetch<{ pelada: PeladaSession }>(
-      `/api/peladas/${peladaId}/live/control`,
+      `/api/groups/${activeGroup.id}/peladas/${peladaId}/live/control`,
       { method: 'POST', body: JSON.stringify(payload) },
       token,
     );
     setPeladas((prev) => prev.map((p) => (p.id === peladaId ? res.pelada : p)));
-    await refreshPeladasAndStats();
+    await refreshActiveWorkspace();
   }
 
   async function handleAddLiveEvent(
@@ -334,34 +444,34 @@ export default function App() {
       assistPlayerId?: string;
     },
   ) {
-    if (!token) throw new Error('Não autenticado');
+    if (!token || !activeGroup) throw new Error('Não autenticado');
     const res = await apiFetch<{ pelada: PeladaSession }>(
-      `/api/peladas/${peladaId}/live/event`,
+      `/api/groups/${activeGroup.id}/peladas/${peladaId}/live/event`,
       { method: 'POST', body: JSON.stringify(payload) },
       token,
     );
     setPeladas((prev) => prev.map((p) => (p.id === peladaId ? res.pelada : p)));
-    await refreshPeladasAndStats();
+    await refreshActiveWorkspace();
   }
 
   async function handleDeleteLiveEvent(peladaId: string, eventId: string) {
-    if (!token) throw new Error('Não autenticado');
+    if (!token || !activeGroup) throw new Error('Não autenticado');
     const res = await apiFetch<{ pelada: PeladaSession }>(
-      `/api/peladas/${peladaId}/live/event/${eventId}`,
+      `/api/groups/${activeGroup.id}/peladas/${peladaId}/live/event/${eventId}`,
       { method: 'DELETE' },
       token,
     );
     setPeladas((prev) => prev.map((p) => (p.id === peladaId ? res.pelada : p)));
-    await refreshPeladasAndStats();
+    await refreshActiveWorkspace();
   }
 
   async function handleCastVote(peladaId: string, targetPlayerId: string) {
-    if (!token) throw new Error('Não autenticado');
+    if (!token || !activeGroup) throw new Error('Não autenticado');
     const res = await apiFetch<{
       pelada: PeladaSession;
       stats: Record<string, PlayerStatsSummary>;
     }>(
-      `/api/peladas/${peladaId}/vote`,
+      `/api/groups/${activeGroup.id}/peladas/${peladaId}/vote`,
       { method: 'POST', body: JSON.stringify({ targetPlayerId }) },
       token,
     );
@@ -375,47 +485,68 @@ export default function App() {
     window.scrollTo({ top: 0, behavior: 'smooth' });
   }
 
-  if (!token || !currentUser) {
+  if (!token || !globalUser || !workspaceUser) {
     return <LoginScreen onLoginSuccess={handleLoginSuccess} />;
   }
 
   return (
     <div className="min-h-screen bg-[#F6F8F7] text-slate-900 flex flex-col">
-      {/* 3-Zone Top Bar Contract (Desktop) & Compact Top App Bar (Mobile) */}
+      {/* Top Bar */}
       <header className="sticky top-0 z-30 bg-white/95 backdrop-blur-md border-b border-slate-200">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 h-14 sm:h-16 flex items-center justify-between gap-8">
-          {/* Zone 1: Single text wordmark */}
-          <button
-            type="button"
-            onClick={() => navigateTo('home')}
-            className="text-lg sm:text-xl font-display font-extrabold tracking-tight text-slate-900 whitespace-nowrap shrink-0 cursor-pointer"
-          >
-            QuadraLivre
-          </button>
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 h-14 sm:h-16 flex items-center justify-between gap-4 sm:gap-8">
+          {/* Zone 1: Back to Hub (when in workspace) or Wordmark */}
+          <div className="flex items-center gap-3 min-w-0">
+            {viewMode === 'workspace' ? (
+              <button
+                type="button"
+                onClick={handleReturnToHub}
+                className="min-h-[40px] px-2.5 -ml-2 rounded-xl hover:bg-slate-100 text-slate-800 inline-flex items-center gap-1.5 text-sm font-semibold whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                <ArrowLeft className="w-4 h-4 text-emerald-700" />
+                <span>Peladas</span>
+              </button>
+            ) : (
+              <span className="text-lg sm:text-xl font-display font-extrabold tracking-tight text-slate-900 whitespace-nowrap shrink-0">
+                QuadraLivre
+              </span>
+            )}
 
-          {/* Zone 2: 5 single-line nav links on desktop */}
-          <nav
-            aria-label="Navegação principal"
-            className="hidden md:flex items-center gap-6"
-          >
-            {NAV_ITEMS.map((item) => {
-              const active = activeTab === item.id;
-              return (
-                <button
-                  key={item.id}
-                  type="button"
-                  onClick={() => navigateTo(item.id)}
-                  className={`min-h-[40px] px-1 text-sm font-semibold border-b-2 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                    active
-                      ? 'border-emerald-700 text-emerald-700'
-                      : 'border-transparent text-slate-600 hover:text-slate-900'
-                  }`}
-                >
-                  {item.label}
-                </button>
-              );
-            })}
-          </nav>
+            {viewMode === 'workspace' && activeGroup && (
+              <span className="hidden sm:inline text-sm font-display font-bold text-slate-900 truncate max-w-[200px] lg:max-w-[260px]">
+                {activeGroup.name}
+              </span>
+            )}
+          </div>
+
+          {/* Zone 2: 5 single-line nav links when inside a Pelada workspace */}
+          {viewMode === 'workspace' && activeGroup ? (
+            <nav
+              aria-label="Navegação da pelada"
+              className="hidden md:flex items-center gap-6"
+            >
+              {NAV_ITEMS.map((item) => {
+                const active = activeTab === item.id;
+                return (
+                  <button
+                    key={item.id}
+                    type="button"
+                    onClick={() => navigateTo(item.id)}
+                    className={`min-h-[40px] px-1 text-sm font-semibold border-b-2 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                      active
+                        ? 'border-emerald-700 text-emerald-700'
+                        : 'border-transparent text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    {item.label}
+                  </button>
+                );
+              })}
+            </nav>
+          ) : (
+            <p className="hidden sm:block text-xs font-medium text-slate-500">
+              Escolha ou crie uma pelada fixa
+            </p>
+          )}
 
           {/* Zone 3: 1 primary action */}
           <div className="flex items-center shrink-0">
@@ -432,7 +563,11 @@ export default function App() {
       </header>
 
       {/* Main Content Container */}
-      <main className="flex-1 w-full max-w-7xl mx-auto px-4 sm:px-6 pt-5 sm:pt-8 pb-24 md:pb-12">
+      <main
+        className={`flex-1 w-full max-w-7xl mx-auto px-4 sm:px-6 pt-5 sm:pt-8 ${
+          viewMode === 'workspace' ? 'pb-24 md:pb-12' : 'pb-12'
+        }`}
+      >
         {globalError && (
           <div
             role="alert"
@@ -442,7 +577,25 @@ export default function App() {
           </div>
         )}
 
-        {loadingData && players.length === 0 ? (
+        {viewMode === 'hub' ? (
+          loadingGroups && groups.length === 0 ? (
+            <div className="space-y-4">
+              <div className="h-36 rounded-2xl bg-slate-200 animate-pulse" />
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div className="h-52 rounded-2xl bg-slate-200 animate-pulse" />
+                <div className="h-52 rounded-2xl bg-slate-200 animate-pulse" />
+              </div>
+            </div>
+          ) : (
+            <PeladaHubView
+              currentUser={globalUser}
+              groups={groups}
+              onOpenGroup={(gid) => openGroupWorkspace(gid)}
+              onJoinGroup={handleJoinGroup}
+              onCreateGroup={handleCreateGroup}
+            />
+          )
+        ) : loadingWorkspace && !activeGroup ? (
           <div className="space-y-4">
             <div className="h-56 rounded-2xl bg-slate-200 animate-pulse" />
             <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
@@ -452,34 +605,35 @@ export default function App() {
               <div className="h-28 rounded-2xl bg-slate-200 animate-pulse" />
             </div>
           </div>
-        ) : (
+        ) : activeGroup ? (
           <>
             {activeTab === 'home' && (
               <HomeDashboard
-                currentUser={currentUser}
-                players={players}
+                activeGroup={activeGroup}
+                currentUser={workspaceUser}
+                players={members}
                 peladas={peladas}
                 finance={finance}
                 stats={stats}
                 onNavigate={navigateTo}
                 onToggleAttendance={(pid) => handleToggleAttendance(pid)}
+                onUpdateGroup={handleUpdateGroup}
+                onDeleteGroup={handleDeleteGroup}
               />
             )}
 
             {activeTab === 'pelada' && (
               <PeladasView
-                currentUser={currentUser}
-                players={players}
+                activeGroup={activeGroup}
+                currentUser={workspaceUser}
+                players={members}
                 peladas={peladas}
-                recurringRules={recurringRules}
                 selectedPeladaId={selectedPeladaId}
                 onSelectPelada={setSelectedPeladaId}
                 onCreatePelada={handleCreatePelada}
                 onDeletePelada={handleDeletePelada}
                 onCancelPelada={handleCancelPelada}
                 onReactivatePelada={handleReactivatePelada}
-                onToggleRecurringRule={handleToggleRecurringRule}
-                onDeleteRecurringRule={handleDeleteRecurringRule}
                 onToggleAttendance={handleToggleAttendance}
                 onDrawTeams={handleDrawTeams}
                 onUpdateTeams={handleUpdateTeams}
@@ -490,8 +644,8 @@ export default function App() {
 
             {activeTab === 'live' && (
               <LiveMatchView
-                currentUser={currentUser}
-                players={players}
+                currentUser={workspaceUser}
+                players={members}
                 peladas={peladas}
                 selectedPeladaId={selectedPeladaId}
                 onSelectPelada={setSelectedPeladaId}
@@ -504,9 +658,12 @@ export default function App() {
 
             {activeTab === 'players' && (
               <PlayersView
-                currentUser={currentUser}
-                players={players}
+                currentUser={workspaceUser}
+                groupName={activeGroup.name}
+                players={members}
+                availableUsers={availableUsers}
                 stats={stats}
+                onAddExistingMember={handleAddExistingMember}
                 onCreatePlayer={handleCreatePlayer}
                 onUpdatePlayer={handleUpdatePlayer}
                 onDeletePlayer={handleDeletePlayer}
@@ -515,43 +672,45 @@ export default function App() {
 
             {activeTab === 'finance' && (
               <FinanceView
-                currentUser={currentUser}
+                currentUser={workspaceUser}
                 entries={finance}
                 onCreateEntry={handleCreateFinance}
                 onDeleteEntry={handleDeleteFinance}
               />
             )}
           </>
-        )}
+        ) : null}
       </main>
 
-      {/* Mobile Fixed Bottom Tab Bar (Thumb-Zone Navigation) */}
-      <nav
-        aria-label="Menu rápido celular"
-        className="md:hidden fixed bottom-0 left-0 right-0 z-40 bg-white/95 backdrop-blur-md border-t border-slate-200 pb-safe"
-      >
-        <div className="grid grid-cols-5 h-16">
-          {NAV_ITEMS.map((item) => {
-            const Icon = item.icon;
-            const active = activeTab === item.id;
-            return (
-              <button
-                key={item.id}
-                type="button"
-                onClick={() => navigateTo(item.id)}
-                className={`flex flex-col items-center justify-center gap-1 transition-colors cursor-pointer ${
-                  active ? 'text-emerald-700' : 'text-slate-500 hover:text-slate-800'
-                }`}
-              >
-                <Icon className="w-5 h-5" strokeWidth={active ? 2.4 : 1.9} />
-                <span className="text-[11px] font-semibold tracking-tight whitespace-nowrap">
-                  {item.label}
-                </span>
-              </button>
-            );
-          })}
-        </div>
-      </nav>
+      {/* Mobile Fixed Bottom Tab Bar (only inside a Pelada workspace) */}
+      {viewMode === 'workspace' && activeGroup && (
+        <nav
+          aria-label="Menu rápido celular"
+          className="md:hidden fixed bottom-0 left-0 right-0 z-40 bg-white/95 backdrop-blur-md border-t border-slate-200 pb-safe"
+        >
+          <div className="grid grid-cols-5 h-16">
+            {NAV_ITEMS.map((item) => {
+              const Icon = item.icon;
+              const active = activeTab === item.id;
+              return (
+                <button
+                  key={item.id}
+                  type="button"
+                  onClick={() => navigateTo(item.id)}
+                  className={`flex flex-col items-center justify-center gap-1 transition-colors cursor-pointer ${
+                    active ? 'text-emerald-700' : 'text-slate-500 hover:text-slate-800'
+                  }`}
+                >
+                  <Icon className="w-5 h-5" strokeWidth={active ? 2.4 : 1.9} />
+                  <span className="text-[11px] font-semibold tracking-tight whitespace-nowrap">
+                    {item.label}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        </nav>
+      )}
     </div>
   );
 }

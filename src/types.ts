@@ -54,6 +54,61 @@ export interface PlayerProfile {
   createdAt: string;
 }
 
+export interface AvailableUserOption {
+  id: string;
+  username: string;
+  name: string;
+  avatarUrl: string;
+  preferredPosition: FutsalPosition;
+  dominantFoot: DominantFoot;
+}
+
+export interface GroupMember {
+  playerId: string;
+  role: UserRole;
+  active: boolean;
+  adminSkills: SkillRatings;
+  finalRating: number;
+  adminReviewed: boolean;
+  joinedAt: string;
+}
+
+export interface PeladaGroup {
+  id: string;
+  name: string;
+  description: string;
+  dayOfWeek: number; // 0 = Domingo ... 6 = Sábado
+  time: string;
+  location: string;
+  teamCount: number;
+  playersPerTeam: number;
+  autoSchedule: boolean;
+  createdBy: string;
+  createdAt: string;
+  members: GroupMember[];
+}
+
+export interface GroupSummary {
+  id: string;
+  name: string;
+  description: string;
+  dayOfWeek: number;
+  time: string;
+  location: string;
+  teamCount: number;
+  playersPerTeam: number;
+  autoSchedule: boolean;
+  memberCount: number;
+  adminCount: number;
+  creatorName: string;
+  isMember: boolean;
+  myRole: UserRole | null;
+  nextMatchDate?: string;
+  nextMatchTime?: string;
+  nextMatchStatus?: PeladaStatus;
+  balance?: number;
+}
+
 export type FinanceType = 'income' | 'expense';
 
 export type FinanceCategory =
@@ -66,6 +121,7 @@ export type FinanceCategory =
 
 export interface FinanceEntry {
   id: string;
+  groupId: string;
   type: FinanceType;
   date: string;
   description: string;
@@ -116,20 +172,9 @@ export interface PostMatchVote {
 
 export type PeladaStatus = 'scheduled' | 'live' | 'completed' | 'cancelled';
 
-export interface RecurringPeladaRule {
-  id: string;
-  title: string;
-  dayOfWeek: number; // 0 = Domingo ... 6 = Sábado
-  time: string;
-  location: string;
-  teamCount: number;
-  playersPerTeam: number;
-  active: boolean;
-  createdAt: string;
-}
-
 export interface PeladaSession {
   id: string;
+  groupId: string;
   title: string;
   date: string;
   time: string;
@@ -142,7 +187,7 @@ export interface PeladaSession {
   adjustmentNote?: string;
   live: LiveMatchState;
   votes: PostMatchVote[];
-  recurringRuleId?: string;
+  autoScheduled?: boolean;
   scheduledAt?: string;
   cancellationReason?: string;
   cancelledAt?: string;

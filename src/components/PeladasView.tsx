@@ -10,7 +10,6 @@ import {
   MapPin,
   Plus,
   Radio,
-  Repeat,
   RotateCcw,
   Shuffle,
   Trash2,
@@ -19,14 +18,13 @@ import {
   X,
 } from 'lucide-react';
 import type {
+  PeladaGroup,
   PeladaSession,
   PlayerProfile,
-  RecurringPeladaRule,
   TeamRoster,
 } from '../types';
 import { formatDateBR } from '../utils/api';
 import {
-  WEEKDAY_NAMES,
   formatDeadlineCountdown,
   formatTimeFromMs,
   getAttendanceDeadlineMs,
@@ -34,10 +32,10 @@ import {
 import { PlayerAvatar } from './PlayerAvatar';
 
 interface PeladasViewProps {
+  activeGroup: PeladaGroup;
   currentUser: PlayerProfile;
   players: PlayerProfile[];
   peladas: PeladaSession[];
-  recurringRules: RecurringPeladaRule[];
   selectedPeladaId: string | null;
   onSelectPelada: (id: string) => void;
   onCreatePelada: (payload: {
@@ -49,13 +47,10 @@ interface PeladasViewProps {
     teamCount: number;
     playersPerTeam: number;
     presentPlayerIds: string[];
-    isRecurring?: boolean;
   }) => Promise<PeladaSession>;
   onDeletePelada: (id: string) => Promise<void>;
   onCancelPelada: (id: string, reason?: string) => Promise<void>;
   onReactivatePelada: (id: string) => Promise<void>;
-  onToggleRecurringRule: (id: string, active: boolean) => Promise<void>;
-  onDeleteRecurringRule: (id: string) => Promise<void>;
   onToggleAttendance: (peladaId: string, playerId?: string) => Promise<void>;
   onDrawTeams: (
     peladaId: string,
@@ -75,18 +70,16 @@ const TEAM_HEADER_STYLES: Record<TeamRoster['color'], string> = {
 };
 
 export function PeladasView({
+  activeGroup,
   currentUser,
   players,
   peladas,
-  recurringRules,
   selectedPeladaId,
   onSelectPelada,
   onCreatePelada,
   onDeletePelada,
   onCancelPelada,
   onReactivatePelada,
-  onToggleRecurringRule,
-  onDeleteRecurringRule,
   onToggleAttendance,
   onDrawTeams,
   onUpdateTeams,
@@ -104,7 +97,6 @@ export function PeladasView({
     peladas.find((p) => p.id === selectedPeladaId) || peladas[0] || null;
 
   const [showCreateModal, setShowCreateModal] = useState(false);
-  const [showRecurringModal, setShowRecurringModal] = useState(false);
   const [showCancelModal, setShowCancelModal] = useState(false);
   const [cancelReason, setCancelReason] = useState('');
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
@@ -116,20 +108,29 @@ export function PeladasView({
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
 
-  // Create pelada form
-  const [title, setTitle] = useState('Pelada Oficial · Quadra Coberta');
+  // Create pelada form defaulted from activeGroup
+  const [title, setTitle] = useState(activeGroup.name);
   const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
-  const [time, setTime] = useState('20:30');
-  const [location, setLocation] = useState('Ginásio Arena Sul — Quadra 1');
-  const [teamCount, setTeamCount] = useState(2);
-  const [playersPerTeam, setPlayersPerTeam] = useState(5);
-  const [isRecurring, setIsRecurring] = useState(false);
+  const [time, setTime] = useState(activeGroup.time || '20:30');
+  const [location, setLocation] = useState(activeGroup.location);
+  const [teamCount, setTeamCount] = useState(activeGroup.teamCount || 2);
+  const [playersPerTeam, setPlayersPerTeam] = useState(
+    activeGroup.playersPerTeam || 5,
+  );
 
   // Admin draw config controls synced with selected pelada
   const [drawTeamCount, setDrawTeamCount] = useState(selectedPelada?.teamCount || 2);
   const [drawPlayersPerTeam, setDrawPlayersPerTeam] = useState(
     selectedPelada?.playersPerTeam || 5,
   );
+
+  useEffect(() => {
+    setTitle(activeGroup.name);
+    setTime(activeGroup.time || '20:30');
+    setLocation(activeGroup.location);
+    setTeamCount(activeGroup.teamCount || 2);
+    setPlayersPerTeam(activeGroup.playersPerTeam || 5);
+  }, [activeGroup.id]);
 
   useEffect(() => {
     if (!selectedPelada) return;
@@ -156,18 +157,16 @@ export function PeladasView({
         ? localDate.toISOString()
         : undefined;
       const created = await onCreatePelada({
-        title: title.trim() || 'Pelada Oficial',
+        title: title.trim() || activeGroup.name,
         date,
         time,
         scheduledAt,
-        location: location.trim() || 'Quadra 1',
+        location: location.trim() || activeGroup.location,
         teamCount,
         playersPerTeam,
         presentPlayerIds: [],
-        isRecurring,
       });
       onSelectPelada(created.id);
-      setIsRecurring(false);
       setShowCreateModal(false);
     } catch (err) {
       setActionError(err instanceof Error ? err.message : 'Erro ao criar pelada.');
@@ -305,19 +304,11 @@ export function PeladasView({
           <div className="flex flex-wrap items-center gap-2 shrink-0">
             <button
               type="button"
-              onClick={() => setShowRecurringModal(true)}
-              className="min-h-[44px] px-4 py-2 rounded-xl border border-slate-300 bg-white hover:bg-slate-50 text-slate-800 text-sm font-semibold flex items-center justify-center gap-2 whitespace-nowrap shrink-0 cursor-pointer"
-            >
-              <Repeat className="w-4 h-4 text-emerald-700" />
-              <span>Peladas Fixas ({recurringRules.filter((r) => r.active).length})</span>
-            </button>
-            <button
-              type="button"
               onClick={() => setShowCreateModal(true)}
               className="min-h-[44px] px-5 py-2.5 rounded-xl bg-emerald-700 hover:bg-emerald-800 text-white text-sm font-semibold flex items-center justify-center gap-2 whitespace-nowrap shrink-0 cursor-pointer"
             >
               <Plus className="w-4 h-4" />
-              <span>Agendar Pelada</span>
+              <span>Agendar Jogo</span>
             </button>
           </div>
         )}
@@ -406,12 +397,12 @@ export function PeladasView({
                 <span className="font-mono tabular-nums text-slate-500">
                   {formatDateBR(selectedPelada.date)} às {selectedPelada.time}
                 </span>
-                {selectedPelada.recurringRuleId && (
+                {selectedPelada.autoScheduled && (
                   <>
                     <span aria-hidden="true" className="text-slate-400">
                       ·
                     </span>
-                    <span className="text-slate-600">Agendamento automático (Fixa)</span>
+                    <span className="text-slate-600">Agendamento automático semanal</span>
                   </>
                 )}
               </div>
@@ -1086,23 +1077,6 @@ export function PeladasView({
                 ({teamCount} times de {playersPerTeam}). Caso os confirmados não completem exatamente as vagas, o app ajusta a divisão automaticamente.
               </p>
 
-              <label className="flex items-start gap-3 p-3.5 rounded-xl border border-slate-200 bg-slate-50 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={isRecurring}
-                  onChange={(e) => setIsRecurring(e.target.checked)}
-                  className="mt-0.5 w-4 h-4 accent-emerald-700"
-                />
-                <div>
-                  <p className="text-sm font-semibold text-slate-900">
-                    Repetir automaticamente toda semana (Pelada Fixa)
-                  </p>
-                  <p className="text-xs text-slate-600 mt-0.5">
-                    O sistema agendará a próxima edição semanal automaticamente no mesmo dia e horário.
-                  </p>
-                </div>
-              </label>
-
               <p className="text-xs text-slate-600">
                 Os atletas deverão confirmar presença até 1h antes do horário marcado para participar do sorteio.
               </p>
@@ -1120,86 +1094,10 @@ export function PeladasView({
                   disabled={busyAction === 'create'}
                   className="min-h-[44px] px-5 rounded-xl bg-emerald-700 hover:bg-emerald-800 text-white text-sm font-semibold cursor-pointer"
                 >
-                  {busyAction === 'create' ? 'Agendando...' : 'Agendar Pelada'}
+                  {busyAction === 'create' ? 'Agendando...' : 'Agendar Jogo'}
                 </button>
               </div>
             </form>
-          </div>
-        </div>
-      )}
-
-      {/* Modal: Gerenciar Peladas Fixas (Agendamento Automático) */}
-      {showRecurringModal && isAdmin && (
-        <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-4">
-          <div className="w-full sm:max-w-xl bg-white rounded-t-3xl sm:rounded-2xl border border-slate-200 p-6 max-h-[90vh] overflow-y-auto">
-            <div className="flex items-center justify-between pb-4 border-b border-slate-200">
-              <div>
-                <h2 className="text-lg font-display font-bold text-slate-900">
-                  Peladas Fixas (Agendamento Automático)
-                </h2>
-                <p className="text-xs text-slate-500 mt-0.5">
-                  Regras ativas agendam automaticamente a próxima data semanal.
-                </p>
-              </div>
-              <button
-                type="button"
-                aria-label="Fechar"
-                onClick={() => setShowRecurringModal(false)}
-                className="min-w-[44px] min-h-[44px] flex items-center justify-center rounded-xl text-slate-500 hover:bg-slate-100 cursor-pointer"
-              >
-                <X className="w-5 h-5" />
-              </button>
-            </div>
-
-            <div className="mt-4 divide-y divide-slate-100">
-              {recurringRules.length === 0 ? (
-                <p className="py-8 text-center text-sm text-slate-500">
-                  Nenhuma pelada fixa configurada. Marque &ldquo;Repetir automaticamente toda semana&rdquo; ao agendar uma pelada.
-                </p>
-              ) : (
-                recurringRules.map((rule) => (
-                  <div
-                    key={rule.id}
-                    className="py-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
-                  >
-                    <div className="min-w-0">
-                      <p className="text-sm font-bold text-slate-900 truncate">
-                        {rule.title}
-                      </p>
-                      <p className="text-xs text-slate-600 mt-0.5">
-                        Toda {WEEKDAY_NAMES[rule.dayOfWeek] || 'semana'} ·{' '}
-                        <span className="font-mono tabular-nums">{rule.time}</span> ·{' '}
-                        {rule.teamCount} times de {rule.playersPerTeam || 5} ·{' '}
-                        <span className={rule.active ? 'text-emerald-700 font-medium' : 'text-slate-400'}>
-                          {rule.active ? 'Ativa' : 'Pausada'}
-                        </span>
-                      </p>
-                      <p className="text-xs text-slate-500 truncate mt-0.5">
-                        {rule.location}
-                      </p>
-                    </div>
-
-                    <div className="flex items-center gap-2 shrink-0">
-                      <button
-                        type="button"
-                        onClick={() => onToggleRecurringRule(rule.id, !rule.active)}
-                        className="min-h-[38px] px-3 rounded-lg border border-slate-200 hover:bg-slate-50 text-xs font-semibold text-slate-700 cursor-pointer"
-                      >
-                        {rule.active ? 'Pausar' : 'Ativar'}
-                      </button>
-                      <button
-                        type="button"
-                        aria-label="Excluir regra fixa"
-                        onClick={() => onDeleteRecurringRule(rule.id)}
-                        className="min-w-[38px] min-h-[38px] flex items-center justify-center rounded-lg border border-slate-200 text-slate-500 hover:text-red-600 hover:bg-red-50 cursor-pointer"
-                      >
-                        <Trash2 className="w-4 h-4" />
-                      </button>
-                    </div>
-                  </div>
-                ))
-              )}
-            </div>
           </div>
         </div>
       )}

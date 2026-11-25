@@ -1,17 +1,21 @@
 import crypto from 'node:crypto';
-import express from 'express';
+import express, { type Response } from 'express';
 import type {
+  AvailableUserOption,
   BloodType,
   DominantFoot,
   FinanceCategory,
   FinanceEntry,
   FinanceType,
   FutsalPosition,
+  GroupMember,
+  GroupSummary,
   MatchEvent,
   MatchEventType,
+  PeladaGroup,
   PeladaSession,
+  PlayerProfile,
   PlayerStatsSummary,
-  RecurringPeladaRule,
   SkillRatings,
   TeamRoster,
   UserRole,
@@ -21,14 +25,15 @@ import {
   type AuthenticatedRequest,
   createSessionToken,
   hashPin,
-  requireAdmin,
   requireAuth,
   verifyPin,
 } from './auth.ts';
 import {
+  type AppDatabase,
   computeFinalRating,
   drawBalancedTeams,
   getDb,
+  getGroupMemberProfiles,
   sanitizeUser,
   saveDb,
   syncRecurringPeladas,
@@ -101,11 +106,14 @@ function normalizeSkills(input: unknown, fallback: SkillRatings): SkillRatings {
   };
 }
 
-function computeStats(peladas: PeladaSession[], users: StoredUser[]): Record<string, PlayerStatsSummary> {
+function computeStats(
+  peladas: PeladaSession[],
+  members: PlayerProfile[],
+): Record<string, PlayerStatsSummary> {
   const stats: Record<string, PlayerStatsSummary> = {};
-  for (const u of users) {
-    stats[u.id] = {
-      playerId: u.id,
+  for (const m of members) {
+    stats[m.id] = {
+      playerId: m.id,
       goals: 0,
       assists: 0,
       saves: 0,
@@ -159,6 +167,139 @@ function computeStats(peladas: PeladaSession[], users: StoredUser[]): Record<str
   return stats;
 }
 
+function getGroupContext(
+  db: AppDatabase,
+  groupId: string,
+  userId: string,
+  res: Response,
+  requireAdminRole = false,
+): { group: PeladaGroup; membership: GroupMember; user: StoredUser } | null {
+  const user = db.users.find((u) => u.id === userId);
+  if (!user || !user.active) {
+    res.status(401).json({ error: 'Usuário não encontrado ou inativo.' });
+    return null;
+  }
+
+  const group = db.groups.find((g) => g.id === groupId);
+  if (!group) {
+    res.status(404).json({ error: 'Pelada fixa não encontrada.' });
+    return null;
+  }
+
+  const membership = group.members.find((m) => m.playerId === userId);
+  if (!membership || !membership.active) {
+    res.status(403).json({
+      error: 'Você não participa desta pelada fixa. Entre no grupo para acessar.',
+    });
+    return null;
+  }
+
+  if (requireAdminRole && membership.role !== 'admin') {
+    res.status(403).json({
+      error: 'Ação restrita aos administradores desta pelada.',
+    });
+    return null;
+  }
+
+  return { group, membership, user };
+}
+
+function buildGroupSummaries(db: AppDatabase, userId: string): GroupSummary[] {
+  const userMap = new Map(db.users.map((u) => [u.id, u]));
+  return db.groups
+    .map((group) => {
+      const membership = group.members.find(
+        (m) => m.playerId === userId && m.active,
+      );
+      const isMember = Boolean(membership);
+      const activeMembers = group.members.filter((m) => {
+        const u = userMap.get(m.playerId);
+        return Boolean(u && u.active && m.active);
+      });
+      const adminCount = activeMembers.filter((m) => m.role === 'admin').length;
+      const creator = userMap.get(group.createdBy);
+
+      const groupPeladas = db.peladas
+        .filter((p) => p.groupId === group.id && p.status !== 'cancelled')
+        .sort((a, b) => a.date.localeCompare(b.date));
+      const nextMatch =
+        groupPeladas.find((p) => p.status === 'live') ||
+        groupPeladas.find((p) => p.status === 'scheduled') ||
+        groupPeladas[groupPeladas.length - 1];
+
+      let balance: number | undefined;
+      if (isMember) {
+        balance = db.finance
+          .filter((f) => f.groupId === group.id)
+          .reduce(
+            (acc, entry) =>
+              entry.type === 'income' ? acc + entry.amount : acc - entry.amount,
+            0,
+          );
+      }
+
+      return {
+        id: group.id,
+        name: group.name,
+        description: group.description,
+        dayOfWeek: group.dayOfWeek,
+        time: group.time,
+        location: group.location,
+        teamCount: group.teamCount,
+        playersPerTeam: group.playersPerTeam || 5,
+        autoSchedule: group.autoSchedule,
+        memberCount: activeMembers.length,
+        adminCount,
+        creatorName: creator?.name || 'Organizador',
+        isMember,
+        myRole: membership ? membership.role : null,
+        nextMatchDate: nextMatch?.date,
+        nextMatchTime: nextMatch?.time,
+        nextMatchStatus: nextMatch?.status,
+        balance,
+      };
+    })
+    .sort((a, b) => {
+      if (a.isMember !== b.isMember) return a.isMember ? -1 : 1;
+      return a.name.localeCompare(b.name, 'pt-BR');
+    });
+}
+
+function buildGroupWorkspace(db: AppDatabase, group: PeladaGroup) {
+  const members = getGroupMemberProfiles(db, group);
+  const memberIds = new Set(group.members.map((m) => m.playerId));
+  const availableUsers: AvailableUserOption[] = db.users
+    .filter((u) => u.active && !memberIds.has(u.id))
+    .map((u) => ({
+      id: u.id,
+      username: u.username,
+      name: u.name,
+      avatarUrl: u.avatarUrl,
+      preferredPosition: u.preferredPosition,
+      dominantFoot: u.dominantFoot,
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'));
+
+  const finance = db.finance
+    .filter((f) => f.groupId === group.id)
+    .sort((a, b) => b.date.localeCompare(a.date));
+
+  const peladas = db.peladas
+    .filter((p) => p.groupId === group.id)
+    .sort((a, b) => b.date.localeCompare(a.date));
+
+  const stats = computeStats(peladas, members);
+
+  return {
+    group,
+    members,
+    availableUsers,
+    finance,
+    peladas,
+    stats,
+  };
+}
+
 export function createApp() {
   const app = express();
   app.use(express.json({ limit: '4mb' }));
@@ -167,7 +308,7 @@ export function createApp() {
     res.json({ ok: true });
   });
 
-  // Authentication
+  // Authentication & Registration
   app.post('/api/auth/login', (req, res) => {
     const username = typeof req.body?.username === 'string'
       ? req.body.username.trim().toLowerCase()
@@ -198,30 +339,12 @@ export function createApp() {
     const token = createSessionToken({
       sub: user.id,
       username: user.username,
-      role: user.role,
     });
 
     res.json({ token, user: sanitizeUser(user) });
   });
 
-  app.get('/api/auth/me', requireAuth, (req: AuthenticatedRequest, res) => {
-    const db = getDb();
-    const user = db.users.find((u) => u.id === req.session?.sub);
-    if (!user || !user.active) {
-      res.status(401).json({ error: 'Usuário não encontrado ou inativo.' });
-      return;
-    }
-    res.json({ user: sanitizeUser(user) });
-  });
-
-  // Players CRUD
-  app.get('/api/players', requireAuth, (_req, res) => {
-    const db = getDb();
-    const players = db.users.map(sanitizeUser);
-    res.json({ players });
-  });
-
-  app.post('/api/players', requireAuth, requireAdmin, (req, res) => {
+  app.post('/api/auth/register', (req, res) => {
     const body = req.body as Record<string, unknown>;
     const username = typeof body.username === 'string'
       ? body.username.trim().toLowerCase()
@@ -236,17 +359,11 @@ export function createApp() {
       return;
     }
     if (name.length < 2 || name.length > 80) {
-      res.status(400).json({ error: 'Informe o nome completo do peladeiro.' });
+      res.status(400).json({ error: 'Informe seu nome completo.' });
       return;
     }
     if (!/^\d{6}$/.test(pin)) {
       res.status(400).json({ error: 'A senha deve conter exatamente 6 dígitos numéricos.' });
-      return;
-    }
-
-    const avatarUrl = typeof body.avatarUrl === 'string' ? body.avatarUrl.trim() : '';
-    if (!isSafeImageUrl(avatarUrl)) {
-      res.status(400).json({ error: 'Formato de foto inválido ou muito grande.' });
       return;
     }
 
@@ -256,7 +373,6 @@ export function createApp() {
       return;
     }
 
-    const role: UserRole = body.role === 'admin' ? 'admin' : 'player';
     const dominantFoot: DominantFoot = VALID_FEET.includes(body.dominantFoot as DominantFoot)
       ? (body.dominantFoot as DominantFoot)
       : 'Destro';
@@ -266,14 +382,6 @@ export function createApp() {
       ? (body.preferredPosition as FutsalPosition)
       : 'Ala Direito';
 
-    const rawHealth = (body.health && typeof body.health === 'object'
-      ? body.health
-      : {}) as Record<string, unknown>;
-
-    const bloodType: BloodType = VALID_BLOOD_TYPES.includes(rawHealth.bloodType as BloodType)
-      ? (rawHealth.bloodType as BloodType)
-      : 'Não informado';
-
     const defaultSkills: SkillRatings = {
       habilidade: 7,
       preparoFisico: 7,
@@ -281,44 +389,29 @@ export function createApp() {
       defesa: 7,
       ataque: 7,
     };
-
-    const selfSkills = normalizeSkills(body.selfSkills, defaultSkills);
-    const adminSkills = normalizeSkills(body.adminSkills, selfSkills);
     const { hash, salt } = hashPin(pin);
 
     const newUser: StoredUser = {
       id: `usr-${crypto.randomUUID().slice(0, 8)}`,
       username,
       name,
-      role,
-      active: body.active === undefined ? true : Boolean(body.active),
-      avatarUrl,
-      address: typeof body.address === 'string' ? body.address.trim().slice(0, 200) : '',
+      role: 'player',
+      active: true,
+      avatarUrl: '',
+      address: '',
       dominantFoot,
       preferredPosition,
       health: {
-        emergencyContact:
-          typeof rawHealth.emergencyContact === 'string'
-            ? rawHealth.emergencyContact.trim().slice(0, 120)
-            : '',
-        healthPlan:
-          typeof rawHealth.healthPlan === 'string'
-            ? rawHealth.healthPlan.trim().slice(0, 100)
-            : '',
-        bloodType,
-        healthIssues:
-          typeof rawHealth.healthIssues === 'string'
-            ? rawHealth.healthIssues.trim().slice(0, 250)
-            : 'Nenhum',
-        continuousMedication:
-          typeof rawHealth.continuousMedication === 'string'
-            ? rawHealth.continuousMedication.trim().slice(0, 250)
-            : 'Nenhum',
+        emergencyContact: '',
+        healthPlan: '',
+        bloodType: 'Não informado',
+        healthIssues: 'Nenhum',
+        continuousMedication: 'Nenhum',
       },
-      selfSkills,
-      adminSkills,
-      finalRating: computeFinalRating(adminSkills),
-      adminReviewed: true,
+      selfSkills: defaultSkills,
+      adminSkills: defaultSkills,
+      finalRating: computeFinalRating(defaultSkills),
+      adminReviewed: false,
       createdAt: new Date().toISOString(),
       pinHash: hash,
       pinSalt: salt,
@@ -326,28 +419,33 @@ export function createApp() {
 
     db.users.push(newUser);
     saveDb(db);
-    res.status(201).json({ player: sanitizeUser(newUser) });
+
+    const token = createSessionToken({
+      sub: newUser.id,
+      username: newUser.username,
+    });
+    res.status(201).json({ token, user: sanitizeUser(newUser) });
   });
 
-  app.put('/api/players/:id', requireAuth, (req: AuthenticatedRequest, res) => {
-    const id = String(req.params.id);
-    const isAdmin = req.session?.role === 'admin';
-    const isSelf = req.session?.sub === id;
-
-    if (!isAdmin && !isSelf) {
-      res.status(403).json({
-        error: 'Você só pode editar a sua própria ficha de peladeiro.',
-      });
-      return;
-    }
-
+  app.get('/api/auth/me', requireAuth, (req: AuthenticatedRequest, res) => {
     const db = getDb();
-    const idx = db.users.findIndex((u) => u.id === id);
-    if (idx === -1) {
-      res.status(404).json({ error: 'Peladeiro não encontrado.' });
+    const user = db.users.find((u) => u.id === req.session?.sub);
+    if (!user || !user.active) {
+      res.status(401).json({ error: 'Usuário não encontrado ou inativo.' });
       return;
     }
+    res.json({ user: sanitizeUser(user) });
+  });
 
+  // Update own global profile (for editing own ficha from Hub or workspace)
+  app.put('/api/auth/me', requireAuth, (req: AuthenticatedRequest, res) => {
+    const userId = req.session?.sub;
+    const db = getDb();
+    const idx = db.users.findIndex((u) => u.id === userId);
+    if (idx === -1) {
+      res.status(404).json({ error: 'Usuário não encontrado.' });
+      return;
+    }
     const current = db.users[idx];
     const body = req.body as Record<string, unknown>;
 
@@ -369,40 +467,6 @@ export function createApp() {
       nextPinSalt = hashed.salt;
     }
 
-    let nextUsername = current.username;
-    if (isAdmin && typeof body.username === 'string') {
-      const candidate = body.username.trim().toLowerCase();
-      if (!/^[a-z0-9._-]{2,30}$/.test(candidate)) {
-        res.status(400).json({ error: 'Login inválido.' });
-        return;
-      }
-      if (db.users.some((u) => u.id !== id && u.username.toLowerCase() === candidate)) {
-        res.status(409).json({ error: `O login "${candidate}" já está em uso.` });
-        return;
-      }
-      nextUsername = candidate;
-    }
-
-    let nextRole = current.role;
-    let nextActive = current.active;
-    if (isAdmin) {
-      if (body.role === 'admin' || body.role === 'player') {
-        nextRole = body.role;
-      }
-      if (typeof body.active === 'boolean') {
-        nextActive = body.active;
-      }
-      const activeAdminsAfter = db.users.filter((u) =>
-        u.id === id ? nextRole === 'admin' && nextActive : u.role === 'admin' && u.active,
-      );
-      if (activeAdminsAfter.length === 0) {
-        res.status(400).json({
-          error: 'O sistema precisa manter pelo menos um administrador ativo.',
-        });
-        return;
-      }
-    }
-
     const rawHealth = (body.health && typeof body.health === 'object'
       ? body.health
       : {}) as Record<string, unknown>;
@@ -411,23 +475,12 @@ export function createApp() {
       ? normalizeSkills(body.selfSkills, current.selfSkills)
       : current.selfSkills;
 
-    const nextAdminSkills =
-      isAdmin && body.adminSkills
-        ? normalizeSkills(body.adminSkills, current.adminSkills)
-        : current.adminSkills;
-
-    const nextAdminReviewed =
-      isAdmin && body.adminSkills ? true : current.adminReviewed;
-
     const updated: StoredUser = {
       ...current,
-      username: nextUsername,
       name:
         typeof body.name === 'string' && body.name.trim().length >= 2
           ? body.name.trim().slice(0, 80)
           : current.name,
-      role: nextRole,
-      active: nextActive,
       avatarUrl:
         typeof body.avatarUrl === 'string' ? body.avatarUrl.trim() : current.avatarUrl,
       address:
@@ -462,61 +515,557 @@ export function createApp() {
             : current.health.continuousMedication,
       },
       selfSkills: nextSelfSkills,
-      adminSkills: nextAdminSkills,
-      finalRating: computeFinalRating(nextAdminSkills),
-      adminReviewed: nextAdminReviewed,
       pinHash: nextPinHash,
       pinSalt: nextPinSalt,
     };
 
     db.users[idx] = updated;
     saveDb(db);
-    res.json({ player: sanitizeUser(updated) });
+    res.json({ user: sanitizeUser(updated) });
   });
 
-  app.delete('/api/players/:id', requireAuth, requireAdmin, (req: AuthenticatedRequest, res) => {
-    const id = String(req.params.id);
-    if (req.session?.sub === id) {
-      res.status(400).json({ error: 'Você não pode excluir o seu próprio usuário.' });
-      return;
-    }
+  // ==========================================
+  // PELADAS FIXAS (MULTI-GROUP HUB & SETTINGS)
+  // ==========================================
 
+  // List all fixed peladas (first page for authenticated users)
+  app.get('/api/groups', requireAuth, (req: AuthenticatedRequest, res) => {
     const db = getDb();
-    const target = db.users.find((u) => u.id === id);
-    if (!target) {
-      res.status(404).json({ error: 'Peladeiro não encontrado.' });
+    syncRecurringPeladas(db);
+    const groups = buildGroupSummaries(db, req.session!.sub);
+    res.json({ groups });
+  });
+
+  // Create a new fixed pelada — ANY authenticated user can create and becomes Admin of THAT pelada!
+  app.post('/api/groups', requireAuth, (req: AuthenticatedRequest, res) => {
+    const userId = req.session!.sub;
+    const db = getDb();
+    const creator = db.users.find((u) => u.id === userId && u.active);
+    if (!creator) {
+      res.status(401).json({ error: 'Usuário inválido ou inativo.' });
       return;
     }
 
-    const remainingAdmins = db.users.filter(
-      (u) => u.id !== id && u.role === 'admin' && u.active,
-    );
-    if (remainingAdmins.length === 0) {
+    const body = req.body as Record<string, unknown>;
+    const name = typeof body.name === 'string' ? body.name.trim().slice(0, 100) : '';
+    if (name.length < 2) {
+      res.status(400).json({ error: 'Informe um nome válido para a pelada fixa.' });
+      return;
+    }
+
+    const description =
+      typeof body.description === 'string' ? body.description.trim().slice(0, 240) : '';
+    const dayOfWeek = Math.max(0, Math.min(6, Number(body.dayOfWeek) || 0));
+    const time =
+      typeof body.time === 'string' && /^\d{2}:\d{2}$/.test(body.time)
+        ? body.time
+        : '20:30';
+    const location =
+      typeof body.location === 'string' && body.location.trim()
+        ? body.location.trim().slice(0, 120)
+        : 'Quadra Principal';
+    const teamCount = Math.max(2, Math.min(6, Number(body.teamCount) || 2));
+    const playersPerTeam = Math.max(3, Math.min(10, Number(body.playersPerTeam) || 5));
+    const autoSchedule = body.autoSchedule === undefined ? true : Boolean(body.autoSchedule);
+
+    const creatorSkills = { ...creator.selfSkills };
+    const newGroup: PeladaGroup = {
+      id: `grp-${crypto.randomUUID().slice(0, 8)}`,
+      name,
+      description,
+      dayOfWeek,
+      time,
+      location,
+      teamCount,
+      playersPerTeam,
+      autoSchedule,
+      createdBy: creator.id,
+      createdAt: new Date().toISOString(),
+      members: [
+        {
+          playerId: creator.id,
+          role: 'admin',
+          active: true,
+          adminSkills: creatorSkills,
+          finalRating: computeFinalRating(creatorSkills),
+          adminReviewed: true,
+          joinedAt: new Date().toISOString(),
+        },
+      ],
+    };
+
+    db.groups.push(newGroup);
+    syncRecurringPeladas(db);
+    saveDb(db);
+
+    const summary = buildGroupSummaries(db, userId).find((g) => g.id === newGroup.id);
+    res.status(201).json({ group: newGroup, summary });
+  });
+
+  // Join an existing fixed pelada as a regular player
+  app.post('/api/groups/:groupId/join', requireAuth, (req: AuthenticatedRequest, res) => {
+    const groupId = String(req.params.groupId);
+    const userId = req.session!.sub;
+    const db = getDb();
+    const user = db.users.find((u) => u.id === userId && u.active);
+    if (!user) {
+      res.status(401).json({ error: 'Usuário inválido ou inativo.' });
+      return;
+    }
+
+    const group = db.groups.find((g) => g.id === groupId);
+    if (!group) {
+      res.status(404).json({ error: 'Pelada fixa não encontrada.' });
+      return;
+    }
+
+    const existing = group.members.find((m) => m.playerId === userId);
+    if (existing) {
+      existing.active = true;
+    } else {
+      const skills = { ...user.selfSkills };
+      group.members.push({
+        playerId: userId,
+        role: 'player',
+        active: true,
+        adminSkills: skills,
+        finalRating: computeFinalRating(skills),
+        adminReviewed: false,
+        joinedAt: new Date().toISOString(),
+      });
+    }
+
+    saveDb(db);
+    res.json({ workspace: buildGroupWorkspace(db, group) });
+  });
+
+  // Full isolated workspace for a fixed pelada
+  app.get('/api/groups/:groupId', requireAuth, (req: AuthenticatedRequest, res) => {
+    const db = getDb();
+    syncRecurringPeladas(db);
+    const ctx = getGroupContext(db, String(req.params.groupId), req.session!.sub, res);
+    if (!ctx) return;
+
+    res.json(buildGroupWorkspace(db, ctx.group));
+  });
+
+  // Update fixed pelada settings (group admin only)
+  app.put('/api/groups/:groupId', requireAuth, (req: AuthenticatedRequest, res) => {
+    const db = getDb();
+    const ctx = getGroupContext(db, String(req.params.groupId), req.session!.sub, res, true);
+    if (!ctx) return;
+
+    const body = req.body as Record<string, unknown>;
+    const { group } = ctx;
+
+    if (typeof body.name === 'string' && body.name.trim().length >= 2) {
+      group.name = body.name.trim().slice(0, 100);
+    }
+    if (typeof body.description === 'string') {
+      group.description = body.description.trim().slice(0, 240);
+    }
+    if (body.dayOfWeek !== undefined) {
+      group.dayOfWeek = Math.max(0, Math.min(6, Number(body.dayOfWeek) || 0));
+    }
+    if (typeof body.time === 'string' && /^\d{2}:\d{2}$/.test(body.time)) {
+      group.time = body.time;
+    }
+    if (typeof body.location === 'string' && body.location.trim()) {
+      group.location = body.location.trim().slice(0, 120);
+    }
+    if (body.teamCount !== undefined) {
+      group.teamCount = Math.max(2, Math.min(6, Number(body.teamCount) || 2));
+    }
+    if (body.playersPerTeam !== undefined) {
+      group.playersPerTeam = Math.max(3, Math.min(10, Number(body.playersPerTeam) || 5));
+    }
+    if (typeof body.autoSchedule === 'boolean') {
+      group.autoSchedule = body.autoSchedule;
+    }
+
+    syncRecurringPeladas(db);
+    saveDb(db);
+    res.json(buildGroupWorkspace(db, group));
+  });
+
+  // Delete fixed pelada (group admin only)
+  app.delete('/api/groups/:groupId', requireAuth, (req: AuthenticatedRequest, res) => {
+    const db = getDb();
+    const ctx = getGroupContext(db, String(req.params.groupId), req.session!.sub, res, true);
+    if (!ctx) return;
+
+    const groupId = ctx.group.id;
+    db.groups = db.groups.filter((g) => g.id !== groupId);
+    db.finance = db.finance.filter((f) => f.groupId !== groupId);
+    db.peladas = db.peladas.filter((p) => p.groupId !== groupId);
+    saveDb(db);
+    res.json({ deletedId: groupId });
+  });
+
+  // ==========================================
+  // GROUP MEMBERS, ADMINS ELECTION & HEALTH
+  // ==========================================
+
+  // Add existing user OR create a new user directly into this pelada (group admin only)
+  app.post('/api/groups/:groupId/members', requireAuth, (req: AuthenticatedRequest, res) => {
+    const db = getDb();
+    const ctx = getGroupContext(db, String(req.params.groupId), req.session!.sub, res, true);
+    if (!ctx) return;
+
+    const { group } = ctx;
+    const body = req.body as Record<string, unknown>;
+    const role: UserRole = body.role === 'admin' ? 'admin' : 'player';
+
+    // Mode 1: Add existing platform user
+    if (typeof body.existingUserId === 'string' && body.existingUserId.trim()) {
+      const targetUser = db.users.find((u) => u.id === body.existingUserId && u.active);
+      if (!targetUser) {
+        res.status(404).json({ error: 'Usuário não encontrado no sistema.' });
+        return;
+      }
+      const existingMember = group.members.find((m) => m.playerId === targetUser.id);
+      if (existingMember) {
+        existingMember.active = true;
+        existingMember.role = role;
+      } else {
+        const skills = { ...targetUser.selfSkills };
+        group.members.push({
+          playerId: targetUser.id,
+          role,
+          active: true,
+          adminSkills: skills,
+          finalRating: computeFinalRating(skills),
+          adminReviewed: true,
+          joinedAt: new Date().toISOString(),
+        });
+      }
+      saveDb(db);
+      res.status(201).json(buildGroupWorkspace(db, group));
+      return;
+    }
+
+    // Mode 2: Create a brand-new user account and add to this pelada
+    const username = typeof body.username === 'string'
+      ? body.username.trim().toLowerCase()
+      : '';
+    const name = typeof body.name === 'string' ? body.name.trim() : '';
+    const pin = typeof body.pin === 'string' ? body.pin.trim() : '';
+
+    if (!/^[a-z0-9._-]{2,30}$/.test(username)) {
       res.status(400).json({
-        error: 'Não é possível excluir o único administrador ativo.',
+        error: 'Login inválido. Use 2 a 30 caracteres (letras minúsculas, números, ponto ou underline).',
+      });
+      return;
+    }
+    if (name.length < 2 || name.length > 80) {
+      res.status(400).json({ error: 'Informe o nome completo do peladeiro.' });
+      return;
+    }
+    if (!/^\d{6}$/.test(pin)) {
+      res.status(400).json({ error: 'A senha deve conter exatamente 6 dígitos numéricos.' });
+      return;
+    }
+
+    const avatarUrl = typeof body.avatarUrl === 'string' ? body.avatarUrl.trim() : '';
+    if (!isSafeImageUrl(avatarUrl)) {
+      res.status(400).json({ error: 'Formato de foto inválido ou muito grande.' });
+      return;
+    }
+
+    if (db.users.some((u) => u.username.toLowerCase() === username)) {
+      res.status(409).json({
+        error: `O login "${username}" já está cadastrado. Use a opção "Adicionar atleta já cadastrado".`,
       });
       return;
     }
 
-    db.users = db.users.filter((u) => u.id !== id);
-    for (const pel of db.peladas) {
-      pel.presentPlayerIds = pel.presentPlayerIds.filter((pid) => pid !== id);
-      for (const team of pel.teams) {
-        team.playerIds = team.playerIds.filter((pid) => pid !== id);
+    const dominantFoot: DominantFoot = VALID_FEET.includes(body.dominantFoot as DominantFoot)
+      ? (body.dominantFoot as DominantFoot)
+      : 'Destro';
+    const preferredPosition: FutsalPosition = VALID_POSITIONS.includes(
+      body.preferredPosition as FutsalPosition,
+    )
+      ? (body.preferredPosition as FutsalPosition)
+      : 'Ala Direito';
+
+    const rawHealth = (body.health && typeof body.health === 'object'
+      ? body.health
+      : {}) as Record<string, unknown>;
+
+    const bloodType: BloodType = VALID_BLOOD_TYPES.includes(rawHealth.bloodType as BloodType)
+      ? (rawHealth.bloodType as BloodType)
+      : 'Não informado';
+
+    const defaultSkills: SkillRatings = {
+      habilidade: 7,
+      preparoFisico: 7,
+      chute: 7,
+      defesa: 7,
+      ataque: 7,
+    };
+    const selfSkills = normalizeSkills(body.selfSkills, defaultSkills);
+    const adminSkills = normalizeSkills(body.adminSkills, selfSkills);
+    const { hash, salt } = hashPin(pin);
+
+    const newUser: StoredUser = {
+      id: `usr-${crypto.randomUUID().slice(0, 8)}`,
+      username,
+      name,
+      role: 'player',
+      active: true,
+      avatarUrl,
+      address: typeof body.address === 'string' ? body.address.trim().slice(0, 200) : '',
+      dominantFoot,
+      preferredPosition,
+      health: {
+        emergencyContact:
+          typeof rawHealth.emergencyContact === 'string'
+            ? rawHealth.emergencyContact.trim().slice(0, 120)
+            : '',
+        healthPlan:
+          typeof rawHealth.healthPlan === 'string'
+            ? rawHealth.healthPlan.trim().slice(0, 100)
+            : '',
+        bloodType,
+        healthIssues:
+          typeof rawHealth.healthIssues === 'string'
+            ? rawHealth.healthIssues.trim().slice(0, 250)
+            : 'Nenhum',
+        continuousMedication:
+          typeof rawHealth.continuousMedication === 'string'
+            ? rawHealth.continuousMedication.trim().slice(0, 250)
+            : 'Nenhum',
+      },
+      selfSkills,
+      adminSkills,
+      finalRating: computeFinalRating(adminSkills),
+      adminReviewed: true,
+      createdAt: new Date().toISOString(),
+      pinHash: hash,
+      pinSalt: salt,
+    };
+
+    db.users.push(newUser);
+    group.members.push({
+      playerId: newUser.id,
+      role,
+      active: body.active === undefined ? true : Boolean(body.active),
+      adminSkills,
+      finalRating: computeFinalRating(adminSkills),
+      adminReviewed: true,
+      joinedAt: new Date().toISOString(),
+    });
+    saveDb(db);
+    res.status(201).json(buildGroupWorkspace(db, group));
+  });
+
+  // Update member in this pelada (elect/remove admin, edit skills, edit profile/health)
+  app.put('/api/groups/:groupId/members/:playerId', requireAuth, (req: AuthenticatedRequest, res) => {
+    const db = getDb();
+    const ctx = getGroupContext(db, String(req.params.groupId), req.session!.sub, res);
+    if (!ctx) return;
+
+    const targetId = String(req.params.playerId);
+    const { group, membership: requesterMembership } = ctx;
+    const isAdmin = requesterMembership.role === 'admin';
+    const isSelf = req.session!.sub === targetId;
+
+    if (!isAdmin && !isSelf) {
+      res.status(403).json({
+        error: 'Você só pode editar a sua própria ficha de peladeiro.',
+      });
+      return;
+    }
+
+    const memberIdx = group.members.findIndex((m) => m.playerId === targetId);
+    const userIdx = db.users.findIndex((u) => u.id === targetId);
+    if (memberIdx === -1 || userIdx === -1) {
+      res.status(404).json({ error: 'Peladeiro não encontrado nesta pelada.' });
+      return;
+    }
+
+    const currentMember = group.members[memberIdx];
+    const currentUser = db.users[userIdx];
+    const body = req.body as Record<string, unknown>;
+
+    if (body.avatarUrl !== undefined && !isSafeImageUrl(body.avatarUrl)) {
+      res.status(400).json({ error: 'Formato de imagem inválido ou muito grande.' });
+      return;
+    }
+
+    // Only allow PIN updates by the account owner themselves (or if user only belongs to this group and admin updates)
+    const groupsWithUser = db.groups.filter((g) =>
+      g.members.some((m) => m.playerId === targetId),
+    );
+    let nextPinHash = currentUser.pinHash;
+    let nextPinSalt = currentUser.pinSalt;
+    if (typeof body.pin === 'string' && body.pin.trim() !== '') {
+      if (!isSelf && groupsWithUser.length > 1) {
+        res.status(403).json({
+          error: 'Como este atleta participa de outras peladas, apenas ele mesmo pode alterar a própria senha.',
+        });
+        return;
+      }
+      const trimmedPin = body.pin.trim();
+      if (!/^\d{6}$/.test(trimmedPin)) {
+        res.status(400).json({ error: 'A senha deve ter exatamente 6 dígitos numéricos.' });
+        return;
+      }
+      const hashed = hashPin(trimmedPin);
+      nextPinHash = hashed.hash;
+      nextPinSalt = hashed.salt;
+    }
+
+    // Group-scoped role & active status (only admins of THIS pelada)
+    let nextRole = currentMember.role;
+    let nextActive = currentMember.active;
+    if (isAdmin) {
+      if (body.role === 'admin' || body.role === 'player') {
+        nextRole = body.role;
+      }
+      if (typeof body.active === 'boolean') {
+        nextActive = body.active;
+      }
+      const activeAdminsAfter = group.members.filter((m) => {
+        const u = db.users.find((usr) => usr.id === m.playerId);
+        if (!u || !u.active) return false;
+        return m.playerId === targetId
+          ? nextRole === 'admin' && nextActive
+          : m.role === 'admin' && m.active;
+      });
+      if (activeAdminsAfter.length === 0) {
+        res.status(400).json({
+          error: 'Esta pelada precisa manter pelo menos um administrador ativo.',
+        });
+        return;
       }
     }
+
+    const rawHealth = (body.health && typeof body.health === 'object'
+      ? body.health
+      : {}) as Record<string, unknown>;
+
+    const nextSelfSkills = body.selfSkills
+      ? normalizeSkills(body.selfSkills, currentUser.selfSkills)
+      : currentUser.selfSkills;
+
+    const nextAdminSkills =
+      isAdmin && body.adminSkills
+        ? normalizeSkills(body.adminSkills, currentMember.adminSkills)
+        : currentMember.adminSkills;
+
+    const nextAdminReviewed =
+      isAdmin && body.adminSkills ? true : currentMember.adminReviewed;
+
+    db.users[userIdx] = {
+      ...currentUser,
+      name:
+        typeof body.name === 'string' && body.name.trim().length >= 2
+          ? body.name.trim().slice(0, 80)
+          : currentUser.name,
+      avatarUrl:
+        typeof body.avatarUrl === 'string'
+          ? body.avatarUrl.trim()
+          : currentUser.avatarUrl,
+      address:
+        typeof body.address === 'string'
+          ? body.address.trim().slice(0, 200)
+          : currentUser.address,
+      dominantFoot: VALID_FEET.includes(body.dominantFoot as DominantFoot)
+        ? (body.dominantFoot as DominantFoot)
+        : currentUser.dominantFoot,
+      preferredPosition: VALID_POSITIONS.includes(body.preferredPosition as FutsalPosition)
+        ? (body.preferredPosition as FutsalPosition)
+        : currentUser.preferredPosition,
+      health: {
+        emergencyContact:
+          typeof rawHealth.emergencyContact === 'string'
+            ? rawHealth.emergencyContact.trim().slice(0, 120)
+            : currentUser.health.emergencyContact,
+        healthPlan:
+          typeof rawHealth.healthPlan === 'string'
+            ? rawHealth.healthPlan.trim().slice(0, 100)
+            : currentUser.health.healthPlan,
+        bloodType: VALID_BLOOD_TYPES.includes(rawHealth.bloodType as BloodType)
+          ? (rawHealth.bloodType as BloodType)
+          : currentUser.health.bloodType,
+        healthIssues:
+          typeof rawHealth.healthIssues === 'string'
+            ? rawHealth.healthIssues.trim().slice(0, 250)
+            : currentUser.health.healthIssues,
+        continuousMedication:
+          typeof rawHealth.continuousMedication === 'string'
+            ? rawHealth.continuousMedication.trim().slice(0, 250)
+            : currentUser.health.continuousMedication,
+      },
+      selfSkills: nextSelfSkills,
+      pinHash: nextPinHash,
+      pinSalt: nextPinSalt,
+    };
+
+    group.members[memberIdx] = {
+      ...currentMember,
+      role: nextRole,
+      active: nextActive,
+      adminSkills: nextAdminSkills,
+      finalRating: computeFinalRating(nextAdminSkills),
+      adminReviewed: nextAdminReviewed,
+    };
+
     saveDb(db);
-    res.json({ deletedId: id });
+    res.json(buildGroupWorkspace(db, group));
   });
 
-  // Finance
-  app.get('/api/finance', requireAuth, (_req, res) => {
+  // Remove a player from this pelada (group admin only)
+  app.delete('/api/groups/:groupId/members/:playerId', requireAuth, (req: AuthenticatedRequest, res) => {
     const db = getDb();
-    const entries = [...db.finance].sort((a, b) => b.date.localeCompare(a.date));
-    res.json({ entries });
+    const ctx = getGroupContext(db, String(req.params.groupId), req.session!.sub, res, true);
+    if (!ctx) return;
+
+    const targetId = String(req.params.playerId);
+    const { group } = ctx;
+    if (req.session!.sub === targetId) {
+      res.status(400).json({ error: 'Você não pode remover a si mesmo desta pelada.' });
+      return;
+    }
+
+    if (!group.members.some((m) => m.playerId === targetId)) {
+      res.status(404).json({ error: 'Peladeiro não encontrado nesta pelada.' });
+      return;
+    }
+
+    const remainingAdmins = group.members.filter(
+      (m) => m.playerId !== targetId && m.role === 'admin' && m.active,
+    );
+    if (remainingAdmins.length === 0) {
+      res.status(400).json({
+        error: 'Não é possível remover o único administrador ativo desta pelada.',
+      });
+      return;
+    }
+
+    group.members = group.members.filter((m) => m.playerId !== targetId);
+    for (const pel of db.peladas) {
+      if (pel.groupId !== group.id) continue;
+      pel.presentPlayerIds = pel.presentPlayerIds.filter((pid) => pid !== targetId);
+      for (const team of pel.teams) {
+        team.playerIds = team.playerIds.filter((pid) => pid !== targetId);
+      }
+    }
+
+    saveDb(db);
+    res.json(buildGroupWorkspace(db, group));
   });
 
-  app.post('/api/finance', requireAuth, requireAdmin, (req: AuthenticatedRequest, res) => {
+  // ==========================================
+  // SCOPED FINANCE PER PELADA
+  // ==========================================
+
+  app.post('/api/groups/:groupId/finance', requireAuth, (req: AuthenticatedRequest, res) => {
+    const db = getDb();
+    const ctx = getGroupContext(db, String(req.params.groupId), req.session!.sub, res, true);
+    if (!ctx) return;
+
     const body = req.body as Record<string, unknown>;
     const type: FinanceType = body.type === 'expense' ? 'expense' : 'income';
     const date = typeof body.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(body.date)
@@ -547,173 +1096,87 @@ export function createApp() {
 
     const entry: FinanceEntry = {
       id: `fin-${crypto.randomUUID().slice(0, 8)}`,
+      groupId: ctx.group.id,
       type,
       date,
       description,
       category,
       amount: Math.round(amount * 100) / 100,
       receiptUrl: receiptUrl || undefined,
-      createdBy: req.session?.sub || 'system',
+      createdBy: req.session!.sub,
       createdAt: new Date().toISOString(),
     };
 
-    const db = getDb();
     db.finance.unshift(entry);
     saveDb(db);
     res.status(201).json({ entry });
   });
 
-  app.delete('/api/finance/:id', requireAuth, requireAdmin, (req, res) => {
-    const id = String(req.params.id);
+  app.delete('/api/groups/:groupId/finance/:entryId', requireAuth, (req: AuthenticatedRequest, res) => {
     const db = getDb();
-    const exists = db.finance.some((f) => f.id === id);
+    const ctx = getGroupContext(db, String(req.params.groupId), req.session!.sub, res, true);
+    if (!ctx) return;
+
+    const entryId = String(req.params.entryId);
+    const exists = db.finance.some(
+      (f) => f.id === entryId && f.groupId === ctx.group.id,
+    );
     if (!exists) {
-      res.status(404).json({ error: 'Lançamento financeiro não encontrado.' });
+      res.status(404).json({ error: 'Lançamento financeiro não encontrado nesta pelada.' });
       return;
     }
-    db.finance = db.finance.filter((f) => f.id !== id);
+    db.finance = db.finance.filter(
+      (f) => !(f.id === entryId && f.groupId === ctx.group.id),
+    );
     saveDb(db);
-    res.json({ deletedId: id });
+    res.json({ deletedId: entryId });
   });
 
-  // Peladas & Matches
-  app.get('/api/peladas', requireAuth, (_req, res) => {
+  // ==========================================
+  // SCOPED MATCH SESSIONS, TEAMS, LIVE & VOTING
+  // ==========================================
+
+  app.post('/api/groups/:groupId/peladas', requireAuth, (req: AuthenticatedRequest, res) => {
     const db = getDb();
-    syncRecurringPeladas(db);
-    const peladas = [...db.peladas].sort((a, b) => b.date.localeCompare(a.date));
-    const stats = computeStats(db.peladas, db.users);
-    res.json({ peladas, stats, recurringRules: db.recurringRules || [] });
-  });
+    const ctx = getGroupContext(db, String(req.params.groupId), req.session!.sub, res, true);
+    if (!ctx) return;
 
-  app.post('/api/peladas/recurring', requireAuth, requireAdmin, (req, res) => {
+    const { group } = ctx;
     const body = req.body as Record<string, unknown>;
     const title = typeof body.title === 'string' && body.title.trim()
       ? body.title.trim().slice(0, 100)
-      : 'Pelada Fixa · Quadra';
-    const dayOfWeek = Math.max(0, Math.min(6, Number(body.dayOfWeek) || 0));
-    const time = typeof body.time === 'string' && /^\d{2}:\d{2}$/.test(body.time)
-      ? body.time
-      : '20:30';
-    const location = typeof body.location === 'string' && body.location.trim()
-      ? body.location.trim().slice(0, 120)
-      : 'Ginásio Arena Sul — Quadra 1';
-    const teamCount = Math.max(2, Math.min(6, Number(body.teamCount) || 2));
-    const playersPerTeam = Math.max(3, Math.min(10, Number(body.playersPerTeam) || 5));
-
-    const db = getDb();
-    const rule: RecurringPeladaRule = {
-      id: `rec-${crypto.randomUUID().slice(0, 8)}`,
-      title,
-      dayOfWeek,
-      time,
-      location,
-      teamCount,
-      playersPerTeam,
-      active: true,
-      createdAt: new Date().toISOString(),
-    };
-    db.recurringRules.push(rule);
-    syncRecurringPeladas(db);
-    saveDb(db);
-    res.status(201).json({ rule, recurringRules: db.recurringRules });
-  });
-
-  app.put('/api/peladas/recurring/:id', requireAuth, requireAdmin, (req, res) => {
-    const id = String(req.params.id);
-    const db = getDb();
-    const rule = db.recurringRules.find((r) => r.id === id);
-    if (!rule) {
-      res.status(404).json({ error: 'Agendamento fixo não encontrado.' });
-      return;
-    }
-    const body = req.body as Record<string, unknown>;
-    if (typeof body.active === 'boolean') rule.active = body.active;
-    if (typeof body.title === 'string' && body.title.trim()) {
-      rule.title = body.title.trim().slice(0, 100);
-    }
-    if (typeof body.time === 'string' && /^\d{2}:\d{2}$/.test(body.time)) {
-      rule.time = body.time;
-    }
-    if (typeof body.location === 'string' && body.location.trim()) {
-      rule.location = body.location.trim().slice(0, 120);
-    }
-    if (body.dayOfWeek !== undefined) {
-      rule.dayOfWeek = Math.max(0, Math.min(6, Number(body.dayOfWeek) || 0));
-    }
-    if (body.teamCount !== undefined) {
-      rule.teamCount = Math.max(2, Math.min(6, Number(body.teamCount) || 2));
-    }
-    if (body.playersPerTeam !== undefined) {
-      rule.playersPerTeam = Math.max(3, Math.min(10, Number(body.playersPerTeam) || 5));
-    }
-    syncRecurringPeladas(db);
-    saveDb(db);
-    res.json({ rule, recurringRules: db.recurringRules });
-  });
-
-  app.delete('/api/peladas/recurring/:id', requireAuth, requireAdmin, (req, res) => {
-    const id = String(req.params.id);
-    const db = getDb();
-    db.recurringRules = db.recurringRules.filter((r) => r.id !== id);
-    saveDb(db);
-    res.json({ deletedId: id, recurringRules: db.recurringRules });
-  });
-
-  app.post('/api/peladas', requireAuth, requireAdmin, (req, res) => {
-    const body = req.body as Record<string, unknown>;
-    const title = typeof body.title === 'string' && body.title.trim()
-      ? body.title.trim().slice(0, 100)
-      : 'Pelada Oficial · Quadra';
+      : `${group.name}`;
     const date = typeof body.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(body.date)
       ? body.date
       : new Date().toISOString().slice(0, 10);
     const time = typeof body.time === 'string' && /^\d{2}:\d{2}$/.test(body.time)
       ? body.time
-      : '20:30';
+      : group.time;
     const scheduledAt =
       typeof body.scheduledAt === 'string' && Number.isFinite(Date.parse(body.scheduledAt))
         ? body.scheduledAt
         : undefined;
     const location = typeof body.location === 'string' && body.location.trim()
       ? body.location.trim().slice(0, 120)
-      : 'Ginásio Arena Sul — Quadra 1';
-    const teamCount = Math.max(2, Math.min(6, Number(body.teamCount) || 2));
-    const playersPerTeam = Math.max(3, Math.min(10, Number(body.playersPerTeam) || 5));
+      : group.location;
+    const teamCount = Math.max(2, Math.min(6, Number(body.teamCount) || group.teamCount));
+    const playersPerTeam = Math.max(
+      3,
+      Math.min(10, Number(body.playersPerTeam) || group.playersPerTeam || 5),
+    );
 
-    const db = getDb();
-    const activeIds = new Set(db.users.filter((u) => u.active).map((u) => u.id));
+    const groupMembers = getGroupMemberProfiles(db, group).filter((m) => m.active);
+    const activeIds = new Set(groupMembers.map((m) => m.id));
     const presentPlayerIds = Array.isArray(body.presentPlayerIds)
       ? body.presentPlayerIds.filter((id): id is string => typeof id === 'string' && activeIds.has(id))
       : [];
 
-    const presentPlayers = db.users
-      .filter((u) => presentPlayerIds.includes(u.id))
-      .map(sanitizeUser);
+    const presentPlayers = groupMembers.filter((m) => presentPlayerIds.includes(m.id));
     const drawResult = drawBalancedTeams(presentPlayers, teamCount, playersPerTeam);
-
-    let recurringRuleId: string | undefined;
-    if (body.isRecurring === true) {
-      const parsedDate = scheduledAt ? new Date(scheduledAt) : new Date(`${date}T${time}:00`);
-      const dayOfWeek = Number.isFinite(parsedDate.getTime())
-        ? parsedDate.getDay()
-        : 2;
-      const rule: RecurringPeladaRule = {
-        id: `rec-${crypto.randomUUID().slice(0, 8)}`,
-        title,
-        dayOfWeek,
-        time,
-        location,
-        teamCount,
-        playersPerTeam,
-        active: true,
-        createdAt: new Date().toISOString(),
-      };
-      db.recurringRules.push(rule);
-      recurringRuleId = rule.id;
-    }
 
     const newPelada: PeladaSession = {
       id: `pel-${crypto.randomUUID().slice(0, 8)}`,
+      groupId: group.id,
       title,
       date,
       time,
@@ -735,79 +1198,39 @@ export function createApp() {
         events: [],
       },
       votes: [],
-      recurringRuleId,
       createdAt: new Date().toISOString(),
     };
 
     db.peladas.unshift(newPelada);
     saveDb(db);
-    res.status(201).json({ pelada: newPelada, recurringRules: db.recurringRules });
+    res.status(201).json({ pelada: newPelada });
   });
 
-  app.put('/api/peladas/:id', requireAuth, requireAdmin, (req, res) => {
-    const id = String(req.params.id);
+  app.delete('/api/groups/:groupId/peladas/:peladaId', requireAuth, (req: AuthenticatedRequest, res) => {
     const db = getDb();
-    const idx = db.peladas.findIndex((p) => p.id === id);
-    if (idx === -1) {
+    const ctx = getGroupContext(db, String(req.params.groupId), req.session!.sub, res, true);
+    if (!ctx) return;
+
+    const peladaId = String(req.params.peladaId);
+    if (!db.peladas.some((p) => p.id === peladaId && p.groupId === ctx.group.id)) {
       res.status(404).json({ error: 'Pelada não encontrada.' });
       return;
     }
-
-    const current = db.peladas[idx];
-    const body = req.body as Record<string, unknown>;
-    const activeIds = new Set(db.users.filter((u) => u.active).map((u) => u.id));
-
-    const presentPlayerIds = Array.isArray(body.presentPlayerIds)
-      ? body.presentPlayerIds.filter((pid): pid is string => typeof pid === 'string' && activeIds.has(pid))
-      : current.presentPlayerIds;
-
-    const teamCount = body.teamCount !== undefined
-      ? Math.max(2, Math.min(6, Number(body.teamCount) || current.teamCount))
-      : current.teamCount;
-    const playersPerTeam = body.playersPerTeam !== undefined
-      ? Math.max(3, Math.min(10, Number(body.playersPerTeam) || current.playersPerTeam || 5))
-      : (current.playersPerTeam || 5);
-
-    const updated: PeladaSession = {
-      ...current,
-      title: typeof body.title === 'string' && body.title.trim()
-        ? body.title.trim().slice(0, 100)
-        : current.title,
-      date: typeof body.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(body.date)
-        ? body.date
-        : current.date,
-      time: typeof body.time === 'string' && /^\d{2}:\d{2}$/.test(body.time)
-        ? body.time
-        : current.time,
-      location: typeof body.location === 'string' && body.location.trim()
-        ? body.location.trim().slice(0, 120)
-        : current.location,
-      teamCount,
-      playersPerTeam,
-      presentPlayerIds,
-    };
-
-    db.peladas[idx] = updated;
+    db.peladas = db.peladas.filter(
+      (p) => !(p.id === peladaId && p.groupId === ctx.group.id),
+    );
     saveDb(db);
-    res.json({ pelada: updated });
+    res.json({ deletedId: peladaId });
   });
 
-  app.delete('/api/peladas/:id', requireAuth, requireAdmin, (req, res) => {
-    const id = String(req.params.id);
+  app.post('/api/groups/:groupId/peladas/:peladaId/cancel', requireAuth, (req: AuthenticatedRequest, res) => {
     const db = getDb();
-    if (!db.peladas.some((p) => p.id === id)) {
-      res.status(404).json({ error: 'Pelada não encontrada.' });
-      return;
-    }
-    db.peladas = db.peladas.filter((p) => p.id !== id);
-    saveDb(db);
-    res.json({ deletedId: id });
-  });
+    const ctx = getGroupContext(db, String(req.params.groupId), req.session!.sub, res, true);
+    if (!ctx) return;
 
-  app.post('/api/peladas/:id/cancel', requireAuth, requireAdmin, (req: AuthenticatedRequest, res) => {
-    const id = String(req.params.id);
-    const db = getDb();
-    const pelada = db.peladas.find((p) => p.id === id);
+    const pelada = db.peladas.find(
+      (p) => p.id === String(req.params.peladaId) && p.groupId === ctx.group.id,
+    );
     if (!pelada) {
       res.status(404).json({ error: 'Pelada não encontrada.' });
       return;
@@ -827,16 +1250,20 @@ export function createApp() {
     pelada.live.lastStartedAt = undefined;
     pelada.cancellationReason = reason;
     pelada.cancelledAt = new Date().toISOString();
-    pelada.cancelledBy = req.session?.sub;
+    pelada.cancelledBy = req.session!.sub;
 
     saveDb(db);
     res.json({ pelada });
   });
 
-  app.post('/api/peladas/:id/reactivate', requireAuth, requireAdmin, (req, res) => {
-    const id = String(req.params.id);
+  app.post('/api/groups/:groupId/peladas/:peladaId/reactivate', requireAuth, (req: AuthenticatedRequest, res) => {
     const db = getDb();
-    const pelada = db.peladas.find((p) => p.id === id);
+    const ctx = getGroupContext(db, String(req.params.groupId), req.session!.sub, res, true);
+    if (!ctx) return;
+
+    const pelada = db.peladas.find(
+      (p) => p.id === String(req.params.peladaId) && p.groupId === ctx.group.id,
+    );
     if (!pelada) {
       res.status(404).json({ error: 'Pelada não encontrada.' });
       return;
@@ -855,23 +1282,30 @@ export function createApp() {
     res.json({ pelada });
   });
 
-  app.post('/api/peladas/:id/attendance', requireAuth, (req: AuthenticatedRequest, res) => {
-    const id = String(req.params.id);
-    const isAdmin = req.session?.role === 'admin';
+  app.post('/api/groups/:groupId/peladas/:peladaId/attendance', requireAuth, (req: AuthenticatedRequest, res) => {
+    const db = getDb();
+    const ctx = getGroupContext(db, String(req.params.groupId), req.session!.sub, res);
+    if (!ctx) return;
+
+    const isAdmin = ctx.membership.role === 'admin';
     const targetPlayerId =
       isAdmin && typeof req.body?.playerId === 'string'
         ? req.body.playerId
-        : req.session?.sub;
+        : req.session!.sub;
 
-    if (!targetPlayerId) {
-      res.status(400).json({ error: 'Jogador inválido.' });
+    const memberExists = ctx.group.members.some(
+      (m) => m.playerId === targetPlayerId && m.active,
+    );
+    if (!memberExists) {
+      res.status(400).json({ error: 'Atleta não pertence a esta pelada.' });
       return;
     }
 
-    const db = getDb();
-    const pelada = db.peladas.find((p) => p.id === id);
+    const pelada = db.peladas.find(
+      (p) => p.id === String(req.params.peladaId) && p.groupId === ctx.group.id,
+    );
     if (!pelada) {
-      res.status(404).json({ error: 'Pelada não encontrada.' });
+      res.status(404).json({ error: 'Partida não encontrada.' });
       return;
     }
     if (pelada.status === 'cancelled') {
@@ -905,10 +1339,14 @@ export function createApp() {
     res.json({ pelada });
   });
 
-  app.post('/api/peladas/:id/draw-teams', requireAuth, requireAdmin, (req, res) => {
-    const id = String(req.params.id);
+  app.post('/api/groups/:groupId/peladas/:peladaId/draw-teams', requireAuth, (req: AuthenticatedRequest, res) => {
     const db = getDb();
-    const pelada = db.peladas.find((p) => p.id === id);
+    const ctx = getGroupContext(db, String(req.params.groupId), req.session!.sub, res, true);
+    if (!ctx) return;
+
+    const pelada = db.peladas.find(
+      (p) => p.id === String(req.params.peladaId) && p.groupId === ctx.group.id,
+    );
     if (!pelada) {
       res.status(404).json({ error: 'Pelada não encontrada.' });
       return;
@@ -927,11 +1365,11 @@ export function createApp() {
 
     pelada.teamCount = teamCount;
     pelada.playersPerTeam = playersPerTeam;
-    const presentPlayers = db.users
-      .filter((u) => u.active && pelada.presentPlayerIds.includes(u.id))
-      .map(sanitizeUser);
 
-    const drawResult = drawBalancedTeams(presentPlayers, teamCount, playersPerTeam);
+    const groupMembers = getGroupMemberProfiles(db, ctx.group).filter(
+      (m) => m.active && pelada.presentPlayerIds.includes(m.id),
+    );
+    const drawResult = drawBalancedTeams(groupMembers, teamCount, playersPerTeam);
     pelada.teams = drawResult.teams;
     pelada.adjustmentNote = drawResult.adjustmentNote;
     pelada.live.homeTeamId = pelada.teams[0]?.id || 'team-a';
@@ -941,10 +1379,14 @@ export function createApp() {
     res.json({ pelada });
   });
 
-  app.put('/api/peladas/:id/teams', requireAuth, requireAdmin, (req, res) => {
-    const id = String(req.params.id);
+  app.put('/api/groups/:groupId/peladas/:peladaId/teams', requireAuth, (req: AuthenticatedRequest, res) => {
     const db = getDb();
-    const pelada = db.peladas.find((p) => p.id === id);
+    const ctx = getGroupContext(db, String(req.params.groupId), req.session!.sub, res, true);
+    if (!ctx) return;
+
+    const pelada = db.peladas.find(
+      (p) => p.id === String(req.params.peladaId) && p.groupId === ctx.group.id,
+    );
     if (!pelada) {
       res.status(404).json({ error: 'Pelada não encontrada.' });
       return;
@@ -990,10 +1432,14 @@ export function createApp() {
   });
 
   // Live Match Controls
-  app.post('/api/peladas/:id/live/control', requireAuth, requireAdmin, (req, res) => {
-    const id = String(req.params.id);
+  app.post('/api/groups/:groupId/peladas/:peladaId/live/control', requireAuth, (req: AuthenticatedRequest, res) => {
     const db = getDb();
-    const pelada = db.peladas.find((p) => p.id === id);
+    const ctx = getGroupContext(db, String(req.params.groupId), req.session!.sub, res, true);
+    if (!ctx) return;
+
+    const pelada = db.peladas.find(
+      (p) => p.id === String(req.params.peladaId) && p.groupId === ctx.group.id,
+    );
     if (!pelada) {
       res.status(404).json({ error: 'Pelada não encontrada.' });
       return;
@@ -1066,10 +1512,14 @@ export function createApp() {
     res.json({ pelada });
   });
 
-  app.post('/api/peladas/:id/live/event', requireAuth, requireAdmin, (req, res) => {
-    const id = String(req.params.id);
+  app.post('/api/groups/:groupId/peladas/:peladaId/live/event', requireAuth, (req: AuthenticatedRequest, res) => {
     const db = getDb();
-    const pelada = db.peladas.find((p) => p.id === id);
+    const ctx = getGroupContext(db, String(req.params.groupId), req.session!.sub, res, true);
+    if (!ctx) return;
+
+    const pelada = db.peladas.find(
+      (p) => p.id === String(req.params.peladaId) && p.groupId === ctx.group.id,
+    );
     if (!pelada) {
       res.status(404).json({ error: 'Pelada não encontrada.' });
       return;
@@ -1136,16 +1586,20 @@ export function createApp() {
     res.status(201).json({ pelada, event });
   });
 
-  app.delete('/api/peladas/:id/live/event/:eventId', requireAuth, requireAdmin, (req, res) => {
-    const id = String(req.params.id);
-    const eventId = String(req.params.eventId);
+  app.delete('/api/groups/:groupId/peladas/:peladaId/live/event/:eventId', requireAuth, (req: AuthenticatedRequest, res) => {
     const db = getDb();
-    const pelada = db.peladas.find((p) => p.id === id);
+    const ctx = getGroupContext(db, String(req.params.groupId), req.session!.sub, res, true);
+    if (!ctx) return;
+
+    const pelada = db.peladas.find(
+      (p) => p.id === String(req.params.peladaId) && p.groupId === ctx.group.id,
+    );
     if (!pelada) {
       res.status(404).json({ error: 'Pelada não encontrada.' });
       return;
     }
 
+    const eventId = String(req.params.eventId);
     const ev = pelada.live.events.find((e) => e.id === eventId);
     if (!ev) {
       res.status(404).json({ error: 'Lance não encontrado.' });
@@ -1166,18 +1620,17 @@ export function createApp() {
   });
 
   // Post-Match Voting
-  app.post('/api/peladas/:id/vote', requireAuth, (req: AuthenticatedRequest, res) => {
-    const id = String(req.params.id);
-    const voterId = req.session?.sub;
+  app.post('/api/groups/:groupId/peladas/:peladaId/vote', requireAuth, (req: AuthenticatedRequest, res) => {
+    const db = getDb();
+    const ctx = getGroupContext(db, String(req.params.groupId), req.session!.sub, res);
+    if (!ctx) return;
+
+    const voterId = req.session!.sub;
     const targetPlayerId = String(req.body?.targetPlayerId || '');
 
-    if (!voterId) {
-      res.status(401).json({ error: 'Usuário não autenticado.' });
-      return;
-    }
-
-    const db = getDb();
-    const pelada = db.peladas.find((p) => p.id === id);
+    const pelada = db.peladas.find(
+      (p) => p.id === String(req.params.peladaId) && p.groupId === ctx.group.id,
+    );
     if (!pelada) {
       res.status(404).json({ error: 'Pelada não encontrada.' });
       return;
@@ -1225,7 +1678,9 @@ export function createApp() {
     }
 
     saveDb(db);
-    const stats = computeStats(db.peladas, db.users);
+    const members = getGroupMemberProfiles(db, ctx.group);
+    const groupPeladas = db.peladas.filter((p) => p.groupId === ctx.group.id);
+    const stats = computeStats(groupPeladas, members);
     res.json({ pelada, stats });
   });
 

@@ -9,9 +9,11 @@ import {
   Trash2,
   Upload,
   User,
+  UserCheck,
   X,
 } from 'lucide-react';
 import type {
+  AvailableUserOption,
   BloodType,
   DominantFoot,
   FutsalPosition,
@@ -65,19 +67,26 @@ function avgSkill(skills: SkillRatings): number {
 
 interface PlayersViewProps {
   currentUser: PlayerProfile;
+  groupName: string;
   players: PlayerProfile[];
+  availableUsers: AvailableUserOption[];
   stats: Record<string, PlayerStatsSummary>;
-  onCreatePlayer: (payload: Record<string, unknown>) => Promise<PlayerProfile>;
-  onUpdatePlayer: (id: string, payload: Record<string, unknown>) => Promise<PlayerProfile>;
+  onAddExistingMember: (existingUserId: string, role: UserRole) => Promise<void>;
+  onCreatePlayer: (payload: Record<string, unknown>) => Promise<void>;
+  onUpdatePlayer: (id: string, payload: Record<string, unknown>) => Promise<void>;
   onDeletePlayer: (id: string) => Promise<void>;
 }
 
 type ModalTab = 'geral' | 'saude' | 'habilidades';
+type AddMode = 'existing' | 'new';
 
 export function PlayersView({
   currentUser,
+  groupName,
   players,
+  availableUsers,
   stats,
+  onAddExistingMember,
   onCreatePlayer,
   onUpdatePlayer,
   onDeletePlayer,
@@ -87,10 +96,15 @@ export function PlayersView({
   const [search, setSearch] = useState('');
   const [positionFilter, setPositionFilter] = useState<'all' | FutsalPosition>('all');
   const [statusFilter, setStatusFilter] = useState<'active' | 'all'>('active');
+  const [roleQuickBusyId, setRoleQuickBusyId] = useState<string | null>(null);
+  const [pageError, setPageError] = useState<string | null>(null);
 
   // Selected player or new player modal
   const [editingPlayer, setEditingPlayer] = useState<PlayerProfile | null>(null);
   const [isCreating, setIsCreating] = useState(false);
+  const [addMode, setAddMode] = useState<AddMode>('existing');
+  const [selectedExistingId, setSelectedExistingId] = useState('');
+  const [existingRole, setExistingRole] = useState<UserRole>('player');
   const [modalTab, setModalTab] = useState<ModalTab>('geral');
   const [confirmDelete, setConfirmDelete] = useState(false);
 
@@ -129,6 +143,11 @@ export function PlayersView({
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
 
+  const admins = useMemo(
+    () => players.filter((p) => p.active && p.role === 'admin'),
+    [players],
+  );
+
   const filteredPlayers = useMemo(() => {
     const q = search.trim().toLowerCase();
     return players
@@ -152,6 +171,9 @@ export function PlayersView({
   function openCreateModal() {
     setIsCreating(true);
     setEditingPlayer(null);
+    setAddMode(availableUsers.length > 0 ? 'existing' : 'new');
+    setSelectedExistingId(availableUsers[0]?.id || '');
+    setExistingRole('player');
     setModalTab('geral');
     setConfirmDelete(false);
     setFormError(null);
@@ -210,6 +232,20 @@ export function PlayersView({
     isCreating ||
     (editingPlayer ? isAdmin || editingPlayer.id === currentUser.id : false);
 
+  async function handleQuickToggleRole(player: PlayerProfile) {
+    if (!isAdmin) return;
+    setPageError(null);
+    setRoleQuickBusyId(player.id);
+    try {
+      const nextRole: UserRole = player.role === 'admin' ? 'player' : 'admin';
+      await onUpdatePlayer(player.id, { role: nextRole });
+    } catch (err) {
+      setPageError(err instanceof Error ? err.message : 'Erro ao alterar papel.');
+    } finally {
+      setRoleQuickBusyId(null);
+    }
+  }
+
   async function handleAvatarUpload(file: File | undefined) {
     if (!file) return;
     setFormError(null);
@@ -218,6 +254,24 @@ export function PlayersView({
       setAvatarUrl(dataUrl);
     } catch (err) {
       setFormError(err instanceof Error ? err.message : 'Erro ao processar foto.');
+    }
+  }
+
+  async function handleAddExistingSubmit(e: FormEvent) {
+    e.preventDefault();
+    if (!selectedExistingId) {
+      setFormError('Selecione um peladeiro cadastrado.');
+      return;
+    }
+    setSaving(true);
+    setFormError(null);
+    try {
+      await onAddExistingMember(selectedExistingId, existingRole);
+      closeModal();
+    } catch (err) {
+      setFormError(err instanceof Error ? err.message : 'Erro ao adicionar peladeiro.');
+    } finally {
+      setSaving(false);
     }
   }
 
@@ -270,8 +324,10 @@ export function PlayersView({
       if (pin.trim()) {
         payload.pin = pin.trim();
       }
-      if (isAdmin) {
+      if (isCreating) {
         payload.username = username.trim().toLowerCase();
+      }
+      if (isAdmin) {
         payload.role = role;
         payload.active = active;
         payload.adminSkills = adminSkills;
@@ -298,7 +354,7 @@ export function PlayersView({
       await onDeletePlayer(editingPlayer.id);
       closeModal();
     } catch (err) {
-      setFormError(err instanceof Error ? err.message : 'Erro ao excluir peladeiro.');
+      setFormError(err instanceof Error ? err.message : 'Erro ao remover peladeiro.');
     } finally {
       setSaving(false);
     }
@@ -310,10 +366,10 @@ export function PlayersView({
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
           <h1 className="text-2xl sm:text-3xl font-display font-bold text-slate-900">
-            Elenco & Fichas de Saúde
+            Elenco & Saúde · {groupName}
           </h1>
           <p className="text-sm text-slate-600 mt-0.5">
-            Notas oficiais, posições, dados médicos de emergência e gestão de peladeiros.
+            Peladeiros desta pelada, administradores eleitos, notas oficiais e fichas médicas.
           </p>
         </div>
 
@@ -332,11 +388,29 @@ export function PlayersView({
               className="min-h-[44px] px-5 py-2.5 rounded-xl bg-emerald-700 hover:bg-emerald-800 text-white text-sm font-semibold flex items-center gap-2 whitespace-nowrap shrink-0 cursor-pointer"
             >
               <Plus className="w-4 h-4" />
-              <span>Novo Peladeiro</span>
+              <span>Adicionar Peladeiro</span>
             </button>
           )}
         </div>
       </div>
+
+      {/* Admins Bar */}
+      <div className="bg-white border border-slate-200 rounded-2xl p-4 sm:px-5 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        <div className="flex items-start sm:items-center gap-2.5 text-xs text-slate-700">
+          <Shield className="w-4 h-4 text-emerald-700 shrink-0 mt-0.5 sm:mt-0" />
+          <p>
+            <strong className="text-slate-900">Administradores desta pelada ({admins.length}):</strong>{' '}
+            {admins.map((a) => a.name).join(', ')}
+            {isAdmin && ' · Você pode eleger ou remover administradores clicando no botão de cada atleta ou editando sua ficha.'}
+          </p>
+        </div>
+      </div>
+
+      {pageError && (
+        <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800">
+          {pageError}
+        </div>
+      )}
 
       {/* Filters */}
       <div className="bg-white border border-slate-200 rounded-2xl p-4 flex flex-col lg:flex-row lg:items-center justify-between gap-3">
@@ -407,87 +481,358 @@ export function PlayersView({
           {filteredPlayers.map((player) => {
             const st = stats[player.id];
             return (
-              <button
+              <div
                 key={player.id}
-                type="button"
-                onClick={() => openPlayerModal(player)}
-                className={`text-left bg-white border rounded-2xl p-5 hover:border-emerald-600 transition-colors cursor-pointer ${
+                className={`bg-white border rounded-2xl p-5 flex flex-col justify-between gap-3 ${
                   player.active
                     ? 'border-slate-200'
                     : 'border-slate-200 opacity-65'
                 }`}
               >
-                <div className="flex items-start justify-between gap-3">
-                  <div className="flex items-center gap-3 min-w-0">
-                    <PlayerAvatar
-                      name={player.name}
-                      src={player.avatarUrl}
-                      size="lg"
-                    />
-                    <div className="min-w-0">
-                      <p className="text-base font-display font-bold text-slate-900 truncate">
-                        {player.name}
+                <button
+                  type="button"
+                  onClick={() => openPlayerModal(player)}
+                  className="text-left w-full cursor-pointer group"
+                >
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="flex items-center gap-3 min-w-0">
+                      <PlayerAvatar
+                        name={player.name}
+                        src={player.avatarUrl}
+                        size="lg"
+                      />
+                      <div className="min-w-0">
+                        <p className="text-base font-display font-bold text-slate-900 truncate group-hover:text-emerald-700 transition-colors">
+                          {player.name}
+                        </p>
+                        <p className="text-xs text-slate-500 truncate mt-0.5">
+                          @{player.username}
+                          <span aria-hidden="true"> · </span>
+                          <span
+                            className={
+                              player.role === 'admin'
+                                ? 'text-emerald-700 font-semibold'
+                                : ''
+                            }
+                          >
+                            {player.role === 'admin' ? 'Admin da Pelada' : 'Peladeiro'}
+                          </span>
+                          {!player.active && (
+                            <>
+                              <span aria-hidden="true"> · </span>
+                              <span className="text-red-700 font-medium">
+                                Inativo
+                              </span>
+                            </>
+                          )}
+                        </p>
+                        <p className="text-xs font-medium text-slate-700 mt-1">
+                          {player.preferredPosition} · {player.dominantFoot}
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="text-right shrink-0">
+                      <p className="text-2xl font-display font-bold font-mono tabular-nums text-emerald-700">
+                        {player.finalRating.toFixed(1)}
                       </p>
-                      <p className="text-xs text-slate-500 truncate mt-0.5">
-                        @{player.username}
-                        <span aria-hidden="true"> · </span>
-                        <span>
-                          {player.role === 'admin' ? 'Admin' : 'Peladeiro'}
-                        </span>
-                        {!player.active && (
-                          <>
-                            <span aria-hidden="true"> · </span>
-                            <span className="text-red-700 font-medium">
-                              Inativo
-                            </span>
-                          </>
-                        )}
-                      </p>
-                      <p className="text-xs font-medium text-slate-700 mt-1">
-                        {player.preferredPosition} · {player.dominantFoot}
-                      </p>
+                      <p className="text-[11px] text-slate-500">Nota</p>
                     </div>
                   </div>
+                </button>
 
-                  <div className="text-right shrink-0">
-                    <p className="text-2xl font-display font-bold font-mono tabular-nums text-emerald-700">
-                      {player.finalRating.toFixed(1)}
-                    </p>
-                    <p className="text-[11px] text-slate-500">Nota</p>
-                  </div>
-                </div>
-
-                <div className="mt-4 pt-3.5 border-t border-slate-100 flex items-center justify-between text-xs text-slate-600 font-mono tabular-nums">
+                <div className="pt-3.5 border-t border-slate-100 flex items-center justify-between gap-2 text-xs text-slate-600 font-mono tabular-nums">
                   <span>
                     {st?.goals || 0}G · {st?.assists || 0}A · {st?.saves || 0}D
                   </span>
-                  <span className="font-sans text-slate-500">
-                    Sangue: <strong className="text-slate-800">{player.health.bloodType}</strong>
-                  </span>
+
+                  <div className="flex items-center gap-2 font-sans">
+                    <span className="text-slate-500">
+                      Sangue: <strong className="text-slate-800">{player.health.bloodType}</strong>
+                    </span>
+                    {isAdmin && player.id !== currentUser.id && player.active && (
+                      <button
+                        type="button"
+                        disabled={roleQuickBusyId === player.id}
+                        onClick={() => handleQuickToggleRole(player)}
+                        className={`min-h-[32px] px-2.5 rounded-lg border text-[11px] font-semibold cursor-pointer transition-colors ${
+                          player.role === 'admin'
+                            ? 'border-amber-200 bg-amber-50 text-amber-800 hover:bg-amber-100'
+                            : 'border-emerald-200 bg-emerald-50 text-emerald-800 hover:bg-emerald-100'
+                        }`}
+                      >
+                        {roleQuickBusyId === player.id
+                          ? '...'
+                          : player.role === 'admin'
+                            ? 'Remover Admin'
+                            : 'Eleger Admin'}
+                      </button>
+                    )}
+                  </div>
                 </div>
-              </button>
+              </div>
             );
           })}
         </div>
       )}
 
-      {/* Modal: Ficha do Peladeiro */}
-      {(isCreating || editingPlayer) && (
+      {/* Modal: Adicionar Peladeiro (Existente ou Novo) */}
+      {isCreating && isAdmin && (
+        <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-4">
+          <div className="w-full sm:max-w-2xl bg-white rounded-t-3xl sm:rounded-2xl border border-slate-200 flex flex-col max-h-[92vh]">
+            <div className="p-5 sm:p-6 border-b border-slate-200 flex items-center justify-between gap-4 shrink-0">
+              <div>
+                <h2 className="text-lg font-display font-bold text-slate-900">
+                  Adicionar Peladeiro · {groupName}
+                </h2>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Inclua alguém já cadastrado no app ou crie um novo login.
+                </p>
+              </div>
+              <button
+                type="button"
+                aria-label="Fechar"
+                onClick={closeModal}
+                className="min-w-[44px] min-h-[44px] flex items-center justify-center rounded-xl text-slate-500 hover:bg-slate-100 cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Mode switcher */}
+            <div className="px-5 sm:px-6 pt-4 shrink-0">
+              <div className="grid grid-cols-2 gap-1 p-1 bg-slate-100 rounded-xl">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setAddMode('existing');
+                    setFormError(null);
+                  }}
+                  className={`min-h-[40px] rounded-lg text-xs sm:text-sm font-semibold inline-flex items-center justify-center gap-1.5 cursor-pointer ${
+                    addMode === 'existing'
+                      ? 'bg-white text-slate-900 shadow-sm'
+                      : 'text-slate-600'
+                  }`}
+                >
+                  <UserCheck className="w-4 h-4" />
+                  <span>Já cadastrado ({availableUsers.length})</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setAddMode('new');
+                    setFormError(null);
+                  }}
+                  className={`min-h-[40px] rounded-lg text-xs sm:text-sm font-semibold inline-flex items-center justify-center gap-1.5 cursor-pointer ${
+                    addMode === 'new'
+                      ? 'bg-white text-slate-900 shadow-sm'
+                      : 'text-slate-600'
+                  }`}
+                >
+                  <Plus className="w-4 h-4" />
+                  <span>Cadastrar novo</span>
+                </button>
+              </div>
+            </div>
+
+            {addMode === 'existing' ? (
+              <form
+                onSubmit={handleAddExistingSubmit}
+                className="flex-1 overflow-y-auto p-5 sm:p-6 space-y-4"
+              >
+                {availableUsers.length === 0 ? (
+                  <p className="py-6 text-center text-sm text-slate-500">
+                    Todos os usuários cadastrados na plataforma já participam desta pelada. Use a aba &ldquo;Cadastrar novo&rdquo; para criar um novo peladeiro.
+                  </p>
+                ) : (
+                  <>
+                    <div>
+                      <label className="block text-xs font-medium text-slate-700 mb-1">
+                        Selecionar atleta
+                      </label>
+                      <select
+                        value={selectedExistingId}
+                        onChange={(e) => setSelectedExistingId(e.target.value)}
+                        className="w-full h-11 px-3 rounded-xl border border-slate-300 bg-white text-sm text-slate-900"
+                      >
+                        {availableUsers.map((u) => (
+                          <option key={u.id} value={u.id}>
+                            {u.name} (@{u.username}) · {u.preferredPosition}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-medium text-slate-700 mb-1">
+                        Papel nesta pelada
+                      </label>
+                      <select
+                        value={existingRole}
+                        onChange={(e) => setExistingRole(e.target.value as UserRole)}
+                        className="w-full h-11 px-3 rounded-xl border border-slate-300 bg-white text-sm text-slate-900"
+                      >
+                        <option value="player">Peladeiro</option>
+                        <option value="admin">Administrador desta pelada</option>
+                      </select>
+                    </div>
+                  </>
+                )}
+
+                {formError && (
+                  <div className="rounded-xl border border-red-200 bg-red-50 px-3.5 py-2.5 text-xs text-red-800">
+                    {formError}
+                  </div>
+                )}
+
+                <div className="pt-3 border-t border-slate-200 flex items-center justify-end gap-2">
+                  <button
+                    type="button"
+                    onClick={closeModal}
+                    className="min-h-[44px] px-4 rounded-xl border border-slate-200 text-sm font-medium text-slate-700 cursor-pointer"
+                  >
+                    Cancelar
+                  </button>
+                  {availableUsers.length > 0 && (
+                    <button
+                      type="submit"
+                      disabled={saving}
+                      className="min-h-[44px] px-5 rounded-xl bg-emerald-700 hover:bg-emerald-800 text-white text-sm font-semibold cursor-pointer disabled:opacity-60"
+                    >
+                      {saving ? 'Adicionando...' : 'Adicionar à Pelada'}
+                    </button>
+                  )}
+                </div>
+              </form>
+            ) : (
+              <form
+                onSubmit={handleSave}
+                className="flex-1 overflow-y-auto p-5 sm:p-6 space-y-4"
+              >
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-xs font-medium text-slate-700 mb-1">
+                      Nome completo
+                    </label>
+                    <input
+                      type="text"
+                      value={name}
+                      onChange={(e) => setName(e.target.value)}
+                      required
+                      className="w-full h-11 px-3 rounded-xl border border-slate-300 text-sm text-slate-900"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-slate-700 mb-1">
+                      Login de acesso
+                    </label>
+                    <input
+                      type="text"
+                      value={username}
+                      onChange={(e) =>
+                        setUsername(e.target.value.toLowerCase().replace(/[^a-z0-9._-]/g, ''))
+                      }
+                      placeholder="ex: carlos"
+                      required
+                      className="w-full h-11 px-3 rounded-xl border border-slate-300 text-sm text-slate-900"
+                    />
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                  <div>
+                    <label className="block text-xs font-medium text-slate-700 mb-1">
+                      Senha (6 dígitos)
+                    </label>
+                    <input
+                      type="password"
+                      inputMode="numeric"
+                      maxLength={6}
+                      placeholder="123456"
+                      value={pin}
+                      onChange={(e) =>
+                        setPin(e.target.value.replace(/\D/g, '').slice(0, 6))
+                      }
+                      required
+                      className="w-full h-11 px-3 rounded-xl border border-slate-300 text-sm font-mono tracking-widest text-slate-900"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-slate-700 mb-1">
+                      Papel nesta pelada
+                    </label>
+                    <select
+                      value={role}
+                      onChange={(e) => setRole(e.target.value as UserRole)}
+                      className="w-full h-11 px-3 rounded-xl border border-slate-300 text-sm text-slate-900 bg-white"
+                    >
+                      <option value="player">Peladeiro</option>
+                      <option value="admin">Administrador</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-slate-700 mb-1">
+                      Posição preferida
+                    </label>
+                    <select
+                      value={preferredPosition}
+                      onChange={(e) =>
+                        setPreferredPosition(e.target.value as FutsalPosition)
+                      }
+                      className="w-full h-11 px-3 rounded-xl border border-slate-300 text-sm text-slate-900 bg-white"
+                    >
+                      {POSITIONS.map((pos) => (
+                        <option key={pos} value={pos}>
+                          {pos}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+
+                {formError && (
+                  <div className="rounded-xl border border-red-200 bg-red-50 px-3.5 py-2.5 text-xs text-red-800">
+                    {formError}
+                  </div>
+                )}
+
+                <div className="pt-3 border-t border-slate-200 flex items-center justify-end gap-2">
+                  <button
+                    type="button"
+                    onClick={closeModal}
+                    className="min-h-[44px] px-4 rounded-xl border border-slate-200 text-sm font-medium text-slate-700 cursor-pointer"
+                  >
+                    Cancelar
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={saving}
+                    className="min-h-[44px] px-5 rounded-xl bg-emerald-700 hover:bg-emerald-800 text-white text-sm font-semibold cursor-pointer disabled:opacity-60"
+                  >
+                    {saving ? 'Salvando...' : 'Cadastrar na Pelada'}
+                  </button>
+                </div>
+              </form>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Modal: Ficha do Peladeiro Existente */}
+      {!isCreating && editingPlayer && (
         <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-4">
           <div className="w-full sm:max-w-2xl bg-white rounded-t-3xl sm:rounded-2xl border border-slate-200 flex flex-col max-h-[92vh]">
             {/* Modal Header */}
             <div className="p-5 sm:p-6 border-b border-slate-200 flex items-center justify-between gap-4 shrink-0">
               <div className="flex items-center gap-3 min-w-0">
                 <PlayerAvatar
-                  name={name || 'Novo Peladeiro'}
+                  name={name || 'Peladeiro'}
                   src={avatarUrl}
                   size="md"
                 />
                 <div className="min-w-0">
                   <h2 className="text-lg font-display font-bold text-slate-900 truncate">
-                    {isCreating
-                      ? 'Cadastrar Novo Peladeiro'
-                      : editingPlayer?.name || 'Ficha do Peladeiro'}
+                    {editingPlayer.name}
                   </h2>
                   <p className="text-xs text-slate-500">
                     {canEditSelected
@@ -603,13 +948,8 @@ export function PlayersView({
                       </label>
                       <input
                         type="text"
-                        disabled={!isAdmin}
+                        disabled
                         value={username}
-                        onChange={(e) =>
-                          setUsername(e.target.value.toLowerCase().replace(/[^a-z0-9._-]/g, ''))
-                        }
-                        placeholder="ex: carlos"
-                        required
                         className="w-full h-11 px-3 rounded-xl border border-slate-300 text-sm text-slate-900 disabled:bg-slate-50"
                       />
                     </div>
@@ -617,28 +957,30 @@ export function PlayersView({
 
                   {canEditSelected && (
                     <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-                      <div>
-                        <label className="block text-xs font-medium text-slate-700 mb-1">
-                          {isCreating ? 'Senha (6 dígitos)' : 'Nova senha (6 dígitos, opcional)'}
-                        </label>
-                        <input
-                          type="password"
-                          inputMode="numeric"
-                          maxLength={6}
-                          placeholder={isCreating ? '123456' : 'Deixe vazio p/ manter'}
-                          value={pin}
-                          onChange={(e) =>
-                            setPin(e.target.value.replace(/\D/g, '').slice(0, 6))
-                          }
-                          className="w-full h-11 px-3 rounded-xl border border-slate-300 text-sm font-mono tracking-widest text-slate-900"
-                        />
-                      </div>
+                      {editingPlayer.id === currentUser.id && (
+                        <div>
+                          <label className="block text-xs font-medium text-slate-700 mb-1">
+                            Nova senha (6 dígitos, opcional)
+                          </label>
+                          <input
+                            type="password"
+                            inputMode="numeric"
+                            maxLength={6}
+                            placeholder="Deixe vazio p/ manter"
+                            value={pin}
+                            onChange={(e) =>
+                              setPin(e.target.value.replace(/\D/g, '').slice(0, 6))
+                            }
+                            className="w-full h-11 px-3 rounded-xl border border-slate-300 text-sm font-mono tracking-widest text-slate-900"
+                          />
+                        </div>
+                      )}
 
                       {isAdmin && (
                         <>
                           <div>
                             <label className="block text-xs font-medium text-slate-700 mb-1">
-                              Perfil de acesso
+                              Papel nesta pelada
                             </label>
                             <select
                               value={role}
@@ -646,13 +988,13 @@ export function PlayersView({
                               className="w-full h-11 px-3 rounded-xl border border-slate-300 text-sm text-slate-900 bg-white"
                             >
                               <option value="player">Peladeiro</option>
-                              <option value="admin">Administrador</option>
+                              <option value="admin">Administrador desta pelada</option>
                             </select>
                           </div>
 
                           <div>
                             <label className="block text-xs font-medium text-slate-700 mb-1">
-                              Situação no sistema
+                              Situação nesta pelada
                             </label>
                             <select
                               value={active ? 'active' : 'inactive'}
@@ -818,7 +1160,7 @@ export function PlayersView({
                   <div className="flex flex-wrap items-center justify-between gap-4 pb-4 border-b border-slate-200">
                     <div>
                       <p className="text-xs font-medium text-slate-500">
-                        Nota Final Oficial (usada no sorteio de times)
+                        Nota Final nesta pelada (usada no sorteio de times)
                       </p>
                       <p className="text-3xl font-display font-bold font-mono tabular-nums text-emerald-700 mt-1">
                         {avgSkill(adminSkills).toFixed(1)}{' '}
@@ -878,7 +1220,7 @@ export function PlayersView({
                       <div className="flex items-center gap-2">
                         <Shield className="w-4 h-4 text-emerald-700" />
                         <h3 className="text-sm font-bold text-slate-900">
-                          Revisão Oficial do Administrador
+                          Revisão Oficial do Administrador ({groupName})
                         </h3>
                       </div>
                       {isAdmin && (
@@ -936,8 +1278,6 @@ export function PlayersView({
               <div className="pt-4 border-t border-slate-200 flex flex-wrap items-center justify-between gap-3">
                 <div>
                   {isAdmin &&
-                    !isCreating &&
-                    editingPlayer &&
                     editingPlayer.id !== currentUser.id && (
                       confirmDelete ? (
                         <div className="flex items-center gap-2">
@@ -947,7 +1287,7 @@ export function PlayersView({
                             disabled={saving}
                             className="min-h-[40px] px-3 rounded-xl bg-red-600 text-white text-xs font-semibold cursor-pointer"
                           >
-                            Confirmar exclusão
+                            Confirmar remoção
                           </button>
                           <button
                             type="button"
@@ -964,7 +1304,7 @@ export function PlayersView({
                           className="min-h-[44px] px-3 rounded-xl text-xs font-semibold text-red-700 hover:bg-red-50 inline-flex items-center gap-1.5 cursor-pointer"
                         >
                           <Trash2 className="w-4 h-4" />
-                          <span>Excluir peladeiro</span>
+                          <span>Remover desta pelada</span>
                         </button>
                       )
                     )}
@@ -984,11 +1324,7 @@ export function PlayersView({
                       disabled={saving}
                       className="min-h-[44px] px-5 rounded-xl bg-emerald-700 hover:bg-emerald-800 text-white text-sm font-semibold cursor-pointer disabled:opacity-60"
                     >
-                      {saving
-                        ? 'Salvando...'
-                        : isCreating
-                          ? 'Cadastrar Peladeiro'
-                          : 'Salvar Alterações'}
+                      {saving ? 'Salvando...' : 'Salvar Alterações'}
                     </button>
                   )}
                 </div>

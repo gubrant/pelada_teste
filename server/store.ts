@@ -3,9 +3,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type {
   FinanceEntry,
+  GroupMember,
+  PeladaGroup,
   PeladaSession,
   PlayerProfile,
-  RecurringPeladaRule,
   SkillRatings,
   TeamColor,
   TeamRoster,
@@ -18,10 +19,11 @@ export interface StoredUser extends PlayerProfile {
 }
 
 export interface AppDatabase {
+  schemaVersion: number;
   users: StoredUser[];
+  groups: PeladaGroup[];
   finance: FinanceEntry[];
   peladas: PeladaSession[];
-  recurringRules: RecurringPeladaRule[];
 }
 
 export function computeFinalRating(skills: SkillRatings): number {
@@ -39,6 +41,28 @@ export function sanitizeUser(user: StoredUser): PlayerProfile {
   return safe;
 }
 
+export function getGroupMemberProfiles(
+  db: AppDatabase,
+  group: PeladaGroup,
+): PlayerProfile[] {
+  const userMap = new Map(db.users.map((u) => [u.id, u]));
+  const result: PlayerProfile[] = [];
+  for (const member of group.members) {
+    const user = userMap.get(member.playerId);
+    if (!user) continue;
+    const base = sanitizeUser(user);
+    result.push({
+      ...base,
+      role: member.role,
+      active: user.active && member.active,
+      adminSkills: member.adminSkills,
+      finalRating: member.finalRating,
+      adminReviewed: member.adminReviewed,
+    });
+  }
+  return result;
+}
+
 export interface DrawResult {
   teams: TeamRoster[];
   effectiveTeamCount: number;
@@ -53,7 +77,6 @@ export function drawBalancedTeams(
   const requestedTeams = Math.max(2, Math.min(6, Math.floor(teamCount) || 2));
   const perTeam = Math.max(3, Math.min(10, Math.floor(playersPerTeam) || 5));
 
-  // If too few players to put at least 2 on every requested team, adjust team count down automatically
   let effectiveTeamCount = requestedTeams;
   if (players.length >= 4 && players.length < requestedTeams * 2) {
     effectiveTeamCount = Math.max(2, Math.floor(players.length / 2));
@@ -91,7 +114,6 @@ export function drawBalancedTeams(
   );
 
   const assignPlayer = (player: PlayerProfile) => {
-    // Pick team with fewest players; tie-break by lowest total rating
     const sortedTeams = [...teams].sort((a, b) => {
       if (a.playerIds.length !== b.playerIds.length) {
         return a.playerIds.length - b.playerIds.length;
@@ -183,6 +205,18 @@ function createSeedUser(
     createdAt: new Date().toISOString(),
     pinHash: hash,
     pinSalt: salt,
+  };
+}
+
+function toGroupMember(user: StoredUser, roleOverride?: 'admin' | 'player'): GroupMember {
+  return {
+    playerId: user.id,
+    role: roleOverride || user.role,
+    active: user.active,
+    adminSkills: { ...user.adminSkills },
+    finalRating: user.finalRating,
+    adminReviewed: user.adminReviewed,
+    joinedAt: user.createdAt,
   };
 }
 
@@ -392,9 +426,50 @@ function createInitialSeed(): AppDatabase {
     }),
   ];
 
+  const arenaGroupId = 'grp-arena-sul';
+  const quintaGroupId = 'grp-quinta-vila';
+
+  const groups: PeladaGroup[] = [
+    {
+      id: arenaGroupId,
+      name: 'Pelada Arena Sul · Terças',
+      description: 'Futsal tradicional das terças à noite na quadra coberta da Vila Olímpia.',
+      dayOfWeek: 2,
+      time: '20:30',
+      location: 'Ginásio Arena Sul — Quadra 1',
+      teamCount: 2,
+      playersPerTeam: 5,
+      autoSchedule: true,
+      createdBy: 'usr-didi',
+      createdAt: new Date(Date.now() - 86400000 * 30).toISOString(),
+      members: users.map((u) =>
+        toGroupMember(u, u.id === 'usr-didi' || u.id === 'usr-mario' ? 'admin' : 'player'),
+      ),
+    },
+    {
+      id: quintaGroupId,
+      name: 'Pelada Quinta Show · Vila Mariana',
+      description: 'Pelada de quinta-feira em formato 3 times rotativos na Vila Mariana.',
+      dayOfWeek: 4,
+      time: '21:00',
+      location: 'Quadra Coberta Vila Mariana — Piso Oficial',
+      teamCount: 3,
+      playersPerTeam: 4,
+      autoSchedule: true,
+      createdBy: 'usr-bruno',
+      createdAt: new Date(Date.now() - 86400000 * 14).toISOString(),
+      members: ['usr-bruno', 'usr-mario', 'usr-lucas', 'usr-kaue', 'usr-thiago', 'usr-pedro']
+        .map((id) => users.find((u) => u.id === id)!)
+        .map((u) =>
+          toGroupMember(u, u.id === 'usr-bruno' || u.id === 'usr-mario' ? 'admin' : 'player'),
+        ),
+    },
+  ];
+
   const finance: FinanceEntry[] = [
     {
       id: 'fin-1',
+      groupId: arenaGroupId,
       type: 'income',
       date: formatMonthOffset(-2, 5),
       description: 'Mensalidades da turma — Lote completo',
@@ -405,6 +480,7 @@ function createInitialSeed(): AppDatabase {
     },
     {
       id: 'fin-2',
+      groupId: arenaGroupId,
       type: 'expense',
       date: formatMonthOffset(-2, 8),
       description: 'Locação mensal Ginásio Arena Sul (4 terças)',
@@ -415,6 +491,7 @@ function createInitialSeed(): AppDatabase {
     },
     {
       id: 'fin-3',
+      groupId: arenaGroupId,
       type: 'income',
       date: formatMonthOffset(-1, 6),
       description: 'Mensalidades da turma — Mês anterior',
@@ -425,6 +502,7 @@ function createInitialSeed(): AppDatabase {
     },
     {
       id: 'fin-4',
+      groupId: arenaGroupId,
       type: 'expense',
       date: formatMonthOffset(-1, 10),
       description: 'Locação mensal Ginásio Arena Sul',
@@ -435,6 +513,7 @@ function createInitialSeed(): AppDatabase {
     },
     {
       id: 'fin-5',
+      groupId: arenaGroupId,
       type: 'expense',
       date: formatMonthOffset(-1, 18),
       description: 'Compra de 2 bolas Penalty Max 500 + 12 coletes',
@@ -445,6 +524,7 @@ function createInitialSeed(): AppDatabase {
     },
     {
       id: 'fin-6',
+      groupId: arenaGroupId,
       type: 'income',
       date: formatMonthOffset(0, 4),
       description: 'Mensalidades confirmadas do mês atual',
@@ -455,6 +535,7 @@ function createInitialSeed(): AppDatabase {
     },
     {
       id: 'fin-7',
+      groupId: arenaGroupId,
       type: 'income',
       date: formatMonthOffset(0, 12),
       description: 'Diárias avulsas convidados (3 atletas)',
@@ -465,6 +546,7 @@ function createInitialSeed(): AppDatabase {
     },
     {
       id: 'fin-8',
+      groupId: arenaGroupId,
       type: 'expense',
       date: formatMonthOffset(0, 14),
       description: 'Reserva quadra coberta + arbitragem',
@@ -475,6 +557,7 @@ function createInitialSeed(): AppDatabase {
     },
     {
       id: 'fin-9',
+      groupId: arenaGroupId,
       type: 'expense',
       date: formatMonthOffset(0, 19),
       description: 'Gelo, isotônico e água pós-jogo',
@@ -483,10 +566,47 @@ function createInitialSeed(): AppDatabase {
       createdBy: 'usr-didi',
       createdAt: new Date().toISOString(),
     },
+    // Caixa independente da Pelada Quinta Show
+    {
+      id: 'fin-q1',
+      groupId: quintaGroupId,
+      type: 'income',
+      date: formatMonthOffset(0, 3),
+      description: 'Rateio mensal Quinta Show (6 mensalistas)',
+      category: 'Mensalidade',
+      amount: 720,
+      createdBy: 'usr-bruno',
+      createdAt: new Date().toISOString(),
+    },
+    {
+      id: 'fin-q2',
+      groupId: quintaGroupId,
+      type: 'expense',
+      date: formatMonthOffset(0, 7),
+      description: 'Aluguel quadra Vila Mariana',
+      category: 'Aluguel de Quadra',
+      amount: 460,
+      createdBy: 'usr-bruno',
+      createdAt: new Date().toISOString(),
+    },
+    {
+      id: 'fin-q3',
+      groupId: quintaGroupId,
+      type: 'income',
+      date: formatMonthOffset(0, 15),
+      description: 'Diárias avulsas de quinta-feira',
+      category: 'Diária Avulsa',
+      amount: 180,
+      createdBy: 'usr-mario',
+      createdAt: new Date().toISOString(),
+    },
   ];
 
-  const safeProfiles = users.map(sanitizeUser);
-  const allIds = safeProfiles.map((u) => u.id);
+  const arenaMembers = getGroupMemberProfiles(
+    { schemaVersion: 2, users, groups, finance: [], peladas: [] },
+    groups[0],
+  );
+  const arenaIds = arenaMembers.map((u) => u.id);
 
   const completedPeladaTeams: TeamRoster[] = [
     {
@@ -507,25 +627,18 @@ function createInitialSeed(): AppDatabase {
   const nextDateStr = `${nextMatchDateObj.getFullYear()}-${String(nextMatchDateObj.getMonth() + 1).padStart(2, '0')}-${String(nextMatchDateObj.getDate()).padStart(2, '0')}`;
   const nextTimeStr = `${String(nextMatchDateObj.getHours()).padStart(2, '0')}:${String(nextMatchDateObj.getMinutes()).padStart(2, '0')}`;
 
-  const recurringRules: RecurringPeladaRule[] = [
-    {
-      id: 'rec-terca',
-      title: 'Pelada Fixa · Arena Sul',
-      dayOfWeek: 2, // Terça-feira
-      time: '20:30',
-      location: 'Ginásio Arena Sul — Quadra 1',
-      teamCount: 2,
-      playersPerTeam: 5,
-      active: true,
-      createdAt: new Date().toISOString(),
-    },
-  ];
+  const todayDraw = drawBalancedTeams(arenaMembers.slice(0, 8), 2, 5);
 
-  const todayDraw = drawBalancedTeams(safeProfiles.slice(0, 8), 2, 5);
+  const quintaMembers = getGroupMemberProfiles(
+    { schemaVersion: 2, users, groups, finance: [], peladas: [] },
+    groups[1],
+  );
+  const quintaDraw = drawBalancedTeams(quintaMembers, 3, 4);
 
   const peladas: PeladaSession[] = [
     {
       id: 'pel-today',
+      groupId: arenaGroupId,
       title: 'Pelada de Hoje · Arena Sul',
       date: nextDateStr,
       time: nextTimeStr,
@@ -534,7 +647,7 @@ function createInitialSeed(): AppDatabase {
       teamCount: 2,
       playersPerTeam: 5,
       status: 'scheduled',
-      presentPlayerIds: allIds.slice(0, 8),
+      presentPlayerIds: arenaIds.slice(0, 8),
       teams: todayDraw.teams,
       adjustmentNote: todayDraw.adjustmentNote,
       live: {
@@ -551,6 +664,7 @@ function createInitialSeed(): AppDatabase {
     },
     {
       id: 'pel-last-week',
+      groupId: arenaGroupId,
       title: 'Pelada Semana Passada · Arena Sul',
       date: formatDateOffset(-7),
       time: '20:30',
@@ -558,7 +672,7 @@ function createInitialSeed(): AppDatabase {
       teamCount: 2,
       playersPerTeam: 5,
       status: 'completed',
-      presentPlayerIds: allIds,
+      presentPlayerIds: arenaIds,
       teams: completedPeladaTeams,
       live: {
         homeTeamId: 'team-a',
@@ -630,22 +744,51 @@ function createInitialSeed(): AppDatabase {
       ],
       createdAt: new Date(Date.now() - 86400000 * 7).toISOString(),
     },
+    {
+      id: 'pel-quinta-1',
+      groupId: quintaGroupId,
+      title: 'Quinta Show · Edição da Semana',
+      date: formatDateOffset(2),
+      time: '21:00',
+      location: 'Quadra Coberta Vila Mariana — Piso Oficial',
+      teamCount: 3,
+      playersPerTeam: 4,
+      status: 'scheduled',
+      presentPlayerIds: quintaMembers.map((m) => m.id),
+      teams: quintaDraw.teams,
+      adjustmentNote: quintaDraw.adjustmentNote,
+      live: {
+        homeTeamId: quintaDraw.teams[0]?.id || 'team-a',
+        awayTeamId: quintaDraw.teams[1]?.id || 'team-b',
+        homeScore: 0,
+        awayScore: 0,
+        isRunning: false,
+        elapsedSeconds: 0,
+        events: [],
+      },
+      votes: [],
+      autoScheduled: true,
+      createdAt: new Date().toISOString(),
+    },
   ];
 
-  return { users, finance, peladas, recurringRules };
+  return { schemaVersion: 2, users, groups, finance, peladas };
 }
 
-export function getNextOccurrenceForRule(rule: RecurringPeladaRule): {
+export function getNextOccurrenceForGroup(group: {
+  dayOfWeek: number;
+  time: string;
+}): {
   date: string;
   scheduledAt: string;
 } {
-  const [hh, mm] = rule.time.split(':').map((n) => Number(n) || 0);
+  const [hh, mm] = group.time.split(':').map((n) => Number(n) || 0);
   const now = new Date();
   const candidate = new Date(now);
   candidate.setHours(hh, mm, 0, 0);
 
   const currentDow = candidate.getDay();
-  let daysAhead = (rule.dayOfWeek - currentDow + 7) % 7;
+  let daysAhead = (group.dayOfWeek - currentDow + 7) % 7;
   if (daysAhead === 0 && candidate.getTime() <= now.getTime()) {
     daysAhead = 7;
   }
@@ -656,33 +799,33 @@ export function getNextOccurrenceForRule(rule: RecurringPeladaRule): {
 }
 
 export function syncRecurringPeladas(db: AppDatabase): boolean {
-  if (!Array.isArray(db.recurringRules)) {
-    db.recurringRules = [];
+  if (!Array.isArray(db.groups)) {
+    db.groups = [];
   }
   let changed = false;
 
-  for (const rule of db.recurringRules) {
-    if (!rule.active) continue;
-    const { date, scheduledAt } = getNextOccurrenceForRule(rule);
+  for (const group of db.groups) {
+    if (!group.autoSchedule) continue;
+    const { date, scheduledAt } = getNextOccurrenceForGroup(group);
 
-    // Do not duplicate if already created (even if cancelled/completed/live) for that date & rule or same date+time
     const alreadyExists = db.peladas.some(
       (p) =>
-        (p.recurringRuleId === rule.id && p.date === date) ||
-        (p.date === date && p.time === rule.time && p.title === rule.title),
+        p.groupId === group.id &&
+        ((p.date === date && p.time === group.time) || Boolean(p.autoScheduled && p.date === date)),
     );
     if (alreadyExists) continue;
 
-    const emptyDraw = drawBalancedTeams([], rule.teamCount, rule.playersPerTeam || 5);
+    const emptyDraw = drawBalancedTeams([], group.teamCount, group.playersPerTeam || 5);
     db.peladas.unshift({
       id: `pel-${crypto.randomUUID().slice(0, 8)}`,
-      title: rule.title,
+      groupId: group.id,
+      title: `${group.name} (${date.slice(8, 10)}/${date.slice(5, 7)})`,
       date,
-      time: rule.time,
+      time: group.time,
       scheduledAt,
-      location: rule.location,
-      teamCount: rule.teamCount,
-      playersPerTeam: rule.playersPerTeam || 5,
+      location: group.location,
+      teamCount: group.teamCount,
+      playersPerTeam: group.playersPerTeam || 5,
       status: 'scheduled',
       presentPlayerIds: [],
       teams: emptyDraw.teams,
@@ -696,7 +839,7 @@ export function syncRecurringPeladas(db: AppDatabase): boolean {
         events: [],
       },
       votes: [],
-      recurringRuleId: rule.id,
+      autoScheduled: true,
       createdAt: new Date().toISOString(),
     });
     changed = true;
@@ -716,19 +859,47 @@ export function getDb(): AppDatabase {
   try {
     if (fs.existsSync(dataFilePath)) {
       const raw = fs.readFileSync(dataFilePath, 'utf8');
-      const parsed = JSON.parse(raw) as AppDatabase;
+      const parsed = JSON.parse(raw) as Partial<AppDatabase>;
       if (parsed && Array.isArray(parsed.users) && parsed.users.length > 0) {
-        if (!Array.isArray(parsed.recurringRules)) {
-          parsed.recurringRules = [];
+        if (parsed.schemaVersion === 2 && Array.isArray(parsed.groups)) {
+          const db = parsed as AppDatabase;
+          for (const g of db.groups) {
+            if (!g.playersPerTeam) g.playersPerTeam = 5;
+            if (!Array.isArray(g.members)) g.members = [];
+          }
+          for (const p of db.peladas) {
+            if (!p.playersPerTeam) p.playersPerTeam = 5;
+          }
+          memoryDb = db;
+          syncRecurringPeladas(memoryDb);
+          return memoryDb;
         }
-        for (const r of parsed.recurringRules) {
-          if (!r.playersPerTeam) r.playersPerTeam = 5;
-        }
-        for (const p of parsed.peladas) {
-          if (!p.playersPerTeam) p.playersPerTeam = 5;
-        }
-        memoryDb = parsed;
+        // Migrate v1 data into v2 default group + second demo group if needed
+        const seed = createInitialSeed();
+        const defaultGroupId = seed.groups[0].id;
+        const users = parsed.users as StoredUser[];
+        const migratedGroup: PeladaGroup = {
+          ...seed.groups[0],
+          members: users.map((u) => toGroupMember(u, u.role)),
+        };
+        const migratedFinance = (parsed.finance || []).map((f) => ({
+          ...f,
+          groupId: (f as FinanceEntry).groupId || defaultGroupId,
+        }));
+        const migratedPeladas = (parsed.peladas || []).map((p) => ({
+          ...p,
+          groupId: (p as PeladaSession).groupId || defaultGroupId,
+          playersPerTeam: p.playersPerTeam || 5,
+        }));
+        memoryDb = {
+          schemaVersion: 2,
+          users,
+          groups: [migratedGroup, seed.groups[1]],
+          finance: [...migratedFinance, ...seed.finance.filter((f) => f.groupId !== defaultGroupId)],
+          peladas: [...migratedPeladas, ...seed.peladas.filter((p) => p.groupId !== defaultGroupId)],
+        };
         syncRecurringPeladas(memoryDb);
+        saveDb(memoryDb);
         return memoryDb;
       }
     }

@@ -1,6 +1,5 @@
 import crypto from 'node:crypto';
 import type { NextFunction, Request, Response } from 'express';
-import type { UserRole } from '../src/types.ts';
 
 const EPHEMERAL_FALLBACK_SECRET = crypto.randomBytes(32).toString('hex');
 
@@ -26,7 +25,6 @@ export function verifyPin(pin: string, storedHash: string, storedSalt: string): 
 export interface SessionPayload {
   sub: string;
   username: string;
-  role: UserRole;
   exp: number;
 }
 
@@ -94,21 +92,5 @@ export function requireAuth(
     return;
   }
   req.session = session;
-  next();
-}
-
-export function requireAdmin(
-  req: AuthenticatedRequest,
-  res: Response,
-  next: NextFunction,
-): void {
-  if (!req.session) {
-    res.status(401).json({ error: 'Sessão não autenticada.' });
-    return;
-  }
-  if (req.session.role !== 'admin') {
-    res.status(403).json({ error: 'Acesso restrito a administradores.' });
-    return;
-  }
   next();
 }
