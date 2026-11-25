@@ -1,5 +1,7 @@
 export type UserRole = 'admin' | 'player';
 
+export type AccountApprovalStatus = 'approved' | 'pending' | 'rejected';
+
 export type DominantFoot = 'Destro' | 'Canhoto' | 'Ambidestro';
 
 export type FutsalPosition =
@@ -42,6 +44,9 @@ export interface PlayerProfile {
   name: string;
   role: UserRole;
   active: boolean;
+  approvalStatus?: AccountApprovalStatus;
+  requestedGroupIds?: string[];
+  requestedNotes?: string;
   avatarUrl: string;
   address: string;
   dominantFoot: DominantFoot;
@@ -51,6 +56,26 @@ export interface PlayerProfile {
   adminSkills: SkillRatings;
   finalRating: number;
   adminReviewed: boolean;
+  createdAt: string;
+}
+
+export interface PublicGroupOption {
+  id: string;
+  name: string;
+  dayOfWeek: number;
+  time: string;
+  location: string;
+}
+
+export interface PendingUserSummary {
+  id: string;
+  username: string;
+  name: string;
+  preferredPosition: FutsalPosition;
+  dominantFoot: DominantFoot;
+  requestedGroupIds: string[];
+  requestedGroupNames: string[];
+  requestedNotes: string;
   createdAt: string;
 }
 

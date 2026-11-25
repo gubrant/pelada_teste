@@ -30,7 +30,7 @@ import {
 } from '../utils/peladaTime';
 import { PlayerAvatar } from './PlayerAvatar';
 
-export type AppTab = 'home' | 'pelada' | 'live' | 'players' | 'finance';
+export type AppTab = 'home' | 'pelada' | 'live' | 'players' | 'addPlayer' | 'finance';
 
 interface HomeDashboardProps {
   activeGroup: PeladaGroup;

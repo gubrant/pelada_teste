@@ -171,7 +171,7 @@ export function PlayersView({
   function openCreateModal() {
     setIsCreating(true);
     setEditingPlayer(null);
-    setAddMode(availableUsers.length > 0 ? 'existing' : 'new');
+    setAddMode('new');
     setSelectedExistingId(availableUsers[0]?.id || '');
     setExistingRole('player');
     setModalTab('geral');

@@ -5,9 +5,11 @@ import {
   Home,
   LogOut,
   Radio,
+  UserPlus,
   Users,
   Wallet,
 } from 'lucide-react';
+import { AddPlayerView } from './components/AddPlayerView';
 import { FinanceView } from './components/FinanceView';
 import { HomeDashboard, type AppTab } from './components/HomeDashboard';
 import { LiveMatchView } from './components/LiveMatchView';
@@ -24,6 +26,7 @@ import type {
   MatchEventType,
   PeladaGroup,
   PeladaSession,
+  PendingUserSummary,
   PlayerProfile,
   PlayerStatsSummary,
   TeamRoster,
@@ -31,11 +34,24 @@ import type {
 } from './types';
 import { ApiError, apiFetch } from './utils/api';
 
-const NAV_ITEMS: { id: AppTab; label: string; icon: typeof Home }[] = [
+const NAV_ITEMS: {
+  id: AppTab;
+  label: string;
+  mobileLabel?: string;
+  icon: typeof Home;
+  adminOnly?: boolean;
+}[] = [
   { id: 'home', label: 'Início', icon: Home },
   { id: 'pelada', label: 'Pelada', icon: CalendarDays },
   { id: 'live', label: 'Ao Vivo', icon: Radio },
   { id: 'players', label: 'Elenco', icon: Users },
+  {
+    id: 'addPlayer',
+    label: 'Add Peladeiro',
+    mobileLabel: 'Cadastrar',
+    icon: UserPlus,
+    adminOnly: true,
+  },
   { id: 'finance', label: 'Caixa', icon: Wallet },
 ];
 
@@ -55,6 +71,7 @@ export default function App() {
   // Hub state (first page after login: list of fixed peladas)
   const [viewMode, setViewMode] = useState<'hub' | 'workspace'>('hub');
   const [groups, setGroups] = useState<GroupSummary[]>([]);
+  const [pendingUsers, setPendingUsers] = useState<PendingUserSummary[]>([]);
   const [loadingGroups, setLoadingGroups] = useState(false);
 
   // Active pelada group workspace state
@@ -75,11 +92,22 @@ export default function App() {
     return members.find((m) => m.id === globalUser.id) || globalUser;
   }, [globalUser, members]);
 
+  const visibleNavItems = useMemo(() => {
+    const isAdmin = workspaceUser?.role === 'admin';
+    return NAV_ITEMS.filter((item) => !item.adminOnly || isAdmin);
+  }, [workspaceUser?.role]);
+
+  const adminGroups = useMemo(
+    () => groups.filter((g) => g.isMember && g.myRole === 'admin'),
+    [groups],
+  );
+
   const handleLogout = useCallback(() => {
     setToken(null);
     setGlobalUser(null);
     setViewMode('hub');
     setGroups([]);
+    setPendingUsers([]);
     setActiveGroup(null);
     setMembers([]);
     setAvailableUsers([]);
@@ -109,12 +137,18 @@ export default function App() {
       setLoadingGroups(true);
       setGlobalError(null);
       try {
-        const [meRes, groupsRes] = await Promise.all([
+        const [meRes, groupsRes, pendingRes] = await Promise.all([
           apiFetch<{ user: PlayerProfile }>('/api/auth/me', {}, authToken),
           apiFetch<{ groups: GroupSummary[] }>('/api/groups', {}, authToken),
+          apiFetch<{ pendingUsers: PendingUserSummary[] }>(
+            '/api/pending-users',
+            {},
+            authToken,
+          ).catch(() => ({ pendingUsers: [] })),
         ]);
         setGlobalUser(meRes.user);
         setGroups(groupsRes.groups);
+        setPendingUsers(pendingRes.pendingUsers);
       } catch (err) {
         if (err instanceof ApiError && err.status === 401) {
           handleLogout();
@@ -241,6 +275,44 @@ export default function App() {
     setActiveTab('home');
     setViewMode('workspace');
     window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+
+  async function handleCreateHubPlayer(payload: Record<string, unknown>) {
+    if (!token) throw new Error('Não autenticado');
+    const res = await apiFetch<{ user: PlayerProfile; addedGroupIds: string[] }>(
+      '/api/users',
+      { method: 'POST', body: JSON.stringify(payload) },
+      token,
+    );
+    await loadGroupsList(token);
+    return res;
+  }
+
+  async function handleApprovePendingUser(
+    userId: string,
+    groupIds: string[],
+    role: UserRole,
+  ) {
+    if (!token) throw new Error('Não autenticado');
+    await apiFetch<{ user: PlayerProfile; addedGroupIds: string[] }>(
+      `/api/pending-users/${userId}/approve`,
+      { method: 'POST', body: JSON.stringify({ groupIds, role }) },
+      token,
+    );
+    await loadGroupsList(token);
+    if (activeGroup) {
+      await refreshActiveWorkspace();
+    }
+  }
+
+  async function handleRejectPendingUser(userId: string) {
+    if (!token) throw new Error('Não autenticado');
+    await apiFetch<{ rejectedId: string }>(
+      `/api/pending-users/${userId}/reject`,
+      { method: 'POST' },
+      token,
+    );
+    await loadGroupsList(token);
   }
 
   async function handleUpdateGroup(payload: Record<string, unknown>) {
@@ -518,13 +590,13 @@ export default function App() {
             )}
           </div>
 
-          {/* Zone 2: 5 single-line nav links when inside a Pelada workspace */}
+          {/* Zone 2: Single-line nav links when inside a Pelada workspace */}
           {viewMode === 'workspace' && activeGroup ? (
             <nav
               aria-label="Navegação da pelada"
-              className="hidden md:flex items-center gap-6"
+              className="hidden md:flex items-center gap-4 lg:gap-6"
             >
-              {NAV_ITEMS.map((item) => {
+              {visibleNavItems.map((item) => {
                 const active = activeTab === item.id;
                 return (
                   <button
@@ -590,9 +662,13 @@ export default function App() {
             <PeladaHubView
               currentUser={globalUser}
               groups={groups}
+              pendingUsers={pendingUsers}
               onOpenGroup={(gid) => openGroupWorkspace(gid)}
               onJoinGroup={handleJoinGroup}
               onCreateGroup={handleCreateGroup}
+              onCreateHubPlayer={handleCreateHubPlayer}
+              onApprovePendingUser={handleApprovePendingUser}
+              onRejectPendingUser={handleRejectPendingUser}
             />
           )
         ) : loadingWorkspace && !activeGroup ? (
@@ -670,6 +746,21 @@ export default function App() {
               />
             )}
 
+            {activeTab === 'addPlayer' && workspaceUser.role === 'admin' && (
+              <AddPlayerView
+                groupId={activeGroup.id}
+                groupName={activeGroup.name}
+                availableUsers={availableUsers}
+                pendingUsers={pendingUsers}
+                adminGroups={adminGroups}
+                onCreatePlayer={handleCreatePlayer}
+                onAddExistingMember={handleAddExistingMember}
+                onApprovePendingUser={handleApprovePendingUser}
+                onRejectPendingUser={handleRejectPendingUser}
+                onGoToRoster={() => navigateTo('players')}
+              />
+            )}
+
             {activeTab === 'finance' && (
               <FinanceView
                 currentUser={workspaceUser}
@@ -688,8 +779,12 @@ export default function App() {
           aria-label="Menu rápido celular"
           className="md:hidden fixed bottom-0 left-0 right-0 z-40 bg-white/95 backdrop-blur-md border-t border-slate-200 pb-safe"
         >
-          <div className="grid grid-cols-5 h-16">
-            {NAV_ITEMS.map((item) => {
+          <div
+            className={`grid h-16 ${
+              visibleNavItems.length === 6 ? 'grid-cols-6' : 'grid-cols-5'
+            }`}
+          >
+            {visibleNavItems.map((item) => {
               const Icon = item.icon;
               const active = activeTab === item.id;
               return (
@@ -702,8 +797,8 @@ export default function App() {
                   }`}
                 >
                   <Icon className="w-5 h-5" strokeWidth={active ? 2.4 : 1.9} />
-                  <span className="text-[11px] font-semibold tracking-tight whitespace-nowrap">
-                    {item.label}
+                  <span className="text-[10px] sm:text-[11px] font-semibold tracking-tight whitespace-nowrap">
+                    {item.mobileLabel || item.label}
                   </span>
                 </button>
               );

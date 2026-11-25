@@ -14,8 +14,10 @@ import type {
   MatchEventType,
   PeladaGroup,
   PeladaSession,
+  PendingUserSummary,
   PlayerProfile,
   PlayerStatsSummary,
+  PublicGroupOption,
   SkillRatings,
   TeamRoster,
   UserRole,
@@ -300,12 +302,71 @@ function buildGroupWorkspace(db: AppDatabase, group: PeladaGroup) {
   };
 }
 
+function getAdminGroupIds(db: AppDatabase, userId: string): Set<string> {
+  return new Set(
+    db.groups
+      .filter((g) =>
+        g.members.some(
+          (m) => m.playerId === userId && m.active && m.role === 'admin',
+        ),
+      )
+      .map((g) => g.id),
+  );
+}
+
+function buildPendingUsersForAdmin(
+  db: AppDatabase,
+  adminGroupIds: Set<string>,
+): PendingUserSummary[] {
+  if (adminGroupIds.size === 0) return [];
+  const groupNameMap = new Map(db.groups.map((g) => [g.id, g.name]));
+  return db.users
+    .filter((u) => {
+      if (u.approvalStatus !== 'pending') return false;
+      const reqIds = Array.isArray(u.requestedGroupIds) ? u.requestedGroupIds : [];
+      if (reqIds.length === 0) return true;
+      return reqIds.some((gid) => adminGroupIds.has(gid));
+    })
+    .map((u) => {
+      const reqIds = Array.isArray(u.requestedGroupIds) ? u.requestedGroupIds : [];
+      return {
+        id: u.id,
+        username: u.username,
+        name: u.name,
+        preferredPosition: u.preferredPosition,
+        dominantFoot: u.dominantFoot,
+        requestedGroupIds: reqIds,
+        requestedGroupNames: reqIds
+          .map((gid) => groupNameMap.get(gid))
+          .filter((name): name is string => Boolean(name)),
+        requestedNotes: u.requestedNotes || '',
+        createdAt: u.createdAt,
+      };
+    })
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+}
+
 export function createApp() {
   const app = express();
   app.use(express.json({ limit: '4mb' }));
 
   app.get('/api/health', (_req, res) => {
     res.json({ ok: true });
+  });
+
+  // Public list of fixed peladas (minimal safe metadata for registration preference)
+  app.get('/api/auth/public-groups', (_req, res) => {
+    const db = getDb();
+    const groups: PublicGroupOption[] = db.groups
+      .map((g) => ({
+        id: g.id,
+        name: g.name,
+        dayOfWeek: g.dayOfWeek,
+        time: g.time,
+        location: g.location,
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'));
+    res.json({ groups });
   });
 
   // Authentication & Registration
@@ -326,6 +387,21 @@ export function createApp() {
     const user = db.users.find((u) => u.username.toLowerCase() === username);
     if (!user || !verifyPin(pin, user.pinHash, user.pinSalt)) {
       res.status(401).json({ error: 'Usuário ou senha incorretos.' });
+      return;
+    }
+
+    if (user.approvalStatus === 'pending') {
+      res.status(403).json({
+        error:
+          'Seu cadastro está aguardando aprovação de um administrador e indicação da sua pelada fixa.',
+      });
+      return;
+    }
+
+    if (user.approvalStatus === 'rejected') {
+      res.status(403).json({
+        error: 'Sua solicitação de cadastro não foi aprovada pelo administrador.',
+      });
       return;
     }
 
@@ -373,6 +449,18 @@ export function createApp() {
       return;
     }
 
+    const validGroupIds = new Set(db.groups.map((g) => g.id));
+    const rawRequestedIds = Array.isArray(body.requestedGroupIds)
+      ? body.requestedGroupIds.filter((gid): gid is string => typeof gid === 'string')
+      : typeof body.requestedGroupId === 'string' && body.requestedGroupId.trim()
+        ? [body.requestedGroupId.trim()]
+        : [];
+    const requestedGroupIds = rawRequestedIds.filter((gid) => validGroupIds.has(gid));
+    const requestedNotes =
+      typeof body.requestedNotes === 'string'
+        ? body.requestedNotes.trim().slice(0, 200)
+        : '';
+
     const dominantFoot: DominantFoot = VALID_FEET.includes(body.dominantFoot as DominantFoot)
       ? (body.dominantFoot as DominantFoot)
       : 'Destro';
@@ -396,7 +484,10 @@ export function createApp() {
       username,
       name,
       role: 'player',
-      active: true,
+      active: false,
+      approvalStatus: 'pending',
+      requestedGroupIds,
+      requestedNotes,
       avatarUrl: '',
       address: '',
       dominantFoot,
@@ -420,11 +511,12 @@ export function createApp() {
     db.users.push(newUser);
     saveDb(db);
 
-    const token = createSessionToken({
-      sub: newUser.id,
-      username: newUser.username,
+    res.status(201).json({
+      pendingApproval: true,
+      message:
+        'Solicitação enviada para aprovação! Assim que um administrador aprovar seu cadastro e indicar sua pelada, você poderá acessar com seu login e senha.',
+      user: sanitizeUser(newUser),
     });
-    res.status(201).json({ token, user: sanitizeUser(newUser) });
   });
 
   app.get('/api/auth/me', requireAuth, (req: AuthenticatedRequest, res) => {
@@ -522,6 +614,313 @@ export function createApp() {
     db.users[idx] = updated;
     saveDb(db);
     res.json({ user: sanitizeUser(updated) });
+  });
+
+  // Create a new player account (with login & 6-digit PIN) and optionally enroll in admin's fixed peladas
+  app.post('/api/users', requireAuth, (req: AuthenticatedRequest, res) => {
+    const requesterId = req.session!.sub;
+    const db = getDb();
+    const requester = db.users.find((u) => u.id === requesterId && u.active);
+    if (!requester) {
+      res.status(401).json({ error: 'Usuário inválido ou inativo.' });
+      return;
+    }
+
+    const adminGroupIds = new Set(
+      db.groups
+        .filter((g) =>
+          g.members.some(
+            (m) => m.playerId === requesterId && m.active && m.role === 'admin',
+          ),
+        )
+        .map((g) => g.id),
+    );
+
+    if (adminGroupIds.size === 0) {
+      res.status(403).json({
+        error: 'Apenas administradores de pelada podem cadastrar novos peladeiros.',
+      });
+      return;
+    }
+
+    const body = req.body as Record<string, unknown>;
+    const username = typeof body.username === 'string'
+      ? body.username.trim().toLowerCase()
+      : '';
+    const name = typeof body.name === 'string' ? body.name.trim() : '';
+    const pin = typeof body.pin === 'string' ? body.pin.trim() : '';
+
+    if (!/^[a-z0-9._-]{2,30}$/.test(username)) {
+      res.status(400).json({
+        error: 'Login inválido. Use 2 a 30 caracteres (letras minúsculas, números, ponto ou underline).',
+      });
+      return;
+    }
+    if (name.length < 2 || name.length > 80) {
+      res.status(400).json({ error: 'Informe o nome completo do peladeiro.' });
+      return;
+    }
+    if (!/^\d{6}$/.test(pin)) {
+      res.status(400).json({ error: 'A senha deve conter exatamente 6 dígitos numéricos.' });
+      return;
+    }
+
+    const avatarUrl = typeof body.avatarUrl === 'string' ? body.avatarUrl.trim() : '';
+    if (!isSafeImageUrl(avatarUrl)) {
+      res.status(400).json({ error: 'Formato de foto inválido ou muito grande.' });
+      return;
+    }
+
+    if (db.users.some((u) => u.username.toLowerCase() === username)) {
+      res.status(409).json({
+        error: `O login "${username}" já está cadastrado na plataforma.`,
+      });
+      return;
+    }
+
+    const dominantFoot: DominantFoot = VALID_FEET.includes(body.dominantFoot as DominantFoot)
+      ? (body.dominantFoot as DominantFoot)
+      : 'Destro';
+    const preferredPosition: FutsalPosition = VALID_POSITIONS.includes(
+      body.preferredPosition as FutsalPosition,
+    )
+      ? (body.preferredPosition as FutsalPosition)
+      : 'Ala Direito';
+
+    const rawHealth = (body.health && typeof body.health === 'object'
+      ? body.health
+      : {}) as Record<string, unknown>;
+
+    const bloodType: BloodType = VALID_BLOOD_TYPES.includes(rawHealth.bloodType as BloodType)
+      ? (rawHealth.bloodType as BloodType)
+      : 'Não informado';
+
+    const defaultSkills: SkillRatings = {
+      habilidade: 7,
+      preparoFisico: 7,
+      chute: 7,
+      defesa: 7,
+      ataque: 7,
+    };
+    const selfSkills = normalizeSkills(body.selfSkills, defaultSkills);
+    const adminSkills = normalizeSkills(body.adminSkills, selfSkills);
+    const { hash, salt } = hashPin(pin);
+
+    const newUser: StoredUser = {
+      id: `usr-${crypto.randomUUID().slice(0, 8)}`,
+      username,
+      name,
+      role: 'player',
+      active: true,
+      avatarUrl,
+      address: typeof body.address === 'string' ? body.address.trim().slice(0, 200) : '',
+      dominantFoot,
+      preferredPosition,
+      health: {
+        emergencyContact:
+          typeof rawHealth.emergencyContact === 'string'
+            ? rawHealth.emergencyContact.trim().slice(0, 120)
+            : '',
+        healthPlan:
+          typeof rawHealth.healthPlan === 'string'
+            ? rawHealth.healthPlan.trim().slice(0, 100)
+            : '',
+        bloodType,
+        healthIssues:
+          typeof rawHealth.healthIssues === 'string'
+            ? rawHealth.healthIssues.trim().slice(0, 250)
+            : 'Nenhum',
+        continuousMedication:
+          typeof rawHealth.continuousMedication === 'string'
+            ? rawHealth.continuousMedication.trim().slice(0, 250)
+            : 'Nenhum',
+      },
+      selfSkills,
+      adminSkills,
+      finalRating: computeFinalRating(adminSkills),
+      adminReviewed: true,
+      createdAt: new Date().toISOString(),
+      pinHash: hash,
+      pinSalt: salt,
+    };
+
+    db.users.push(newUser);
+
+    const requestedGroupIds = Array.isArray(body.groupIds)
+      ? body.groupIds.filter((gid): gid is string => typeof gid === 'string')
+      : [];
+    const memberRole: UserRole = body.role === 'admin' ? 'admin' : 'player';
+    const addedGroupIds: string[] = [];
+
+    for (const gid of requestedGroupIds) {
+      if (!adminGroupIds.has(gid)) continue;
+      const group = db.groups.find((g) => g.id === gid);
+      if (!group) continue;
+      if (!group.members.some((m) => m.playerId === newUser.id)) {
+        group.members.push({
+          playerId: newUser.id,
+          role: memberRole,
+          active: true,
+          adminSkills,
+          finalRating: computeFinalRating(adminSkills),
+          adminReviewed: true,
+          joinedAt: new Date().toISOString(),
+        });
+        addedGroupIds.push(gid);
+      }
+    }
+
+    saveDb(db);
+    res.status(201).json({ user: sanitizeUser(newUser), addedGroupIds });
+  });
+
+  // ==========================================
+  // PENDING ACCOUNT APPROVALS (ADMIN ONLY)
+  // ==========================================
+
+  app.get('/api/pending-users', requireAuth, (req: AuthenticatedRequest, res) => {
+    const requesterId = req.session!.sub;
+    const db = getDb();
+    const requester = db.users.find((u) => u.id === requesterId && u.active);
+    if (!requester) {
+      res.status(401).json({ error: 'Usuário inválido ou inativo.' });
+      return;
+    }
+
+    const adminGroupIds = getAdminGroupIds(db, requesterId);
+    if (adminGroupIds.size === 0) {
+      res.json({ pendingUsers: [] });
+      return;
+    }
+
+    const pendingUsers = buildPendingUsersForAdmin(db, adminGroupIds);
+    res.json({ pendingUsers });
+  });
+
+  app.post('/api/pending-users/:userId/approve', requireAuth, (req: AuthenticatedRequest, res) => {
+    const requesterId = req.session!.sub;
+    const targetUserId = String(req.params.userId);
+    const db = getDb();
+    const requester = db.users.find((u) => u.id === requesterId && u.active);
+    if (!requester) {
+      res.status(401).json({ error: 'Usuário inválido ou inativo.' });
+      return;
+    }
+
+    const adminGroupIds = getAdminGroupIds(db, requesterId);
+    if (adminGroupIds.size === 0) {
+      res.status(403).json({
+        error: 'Apenas administradores de pelada podem aprovar novos cadastros.',
+      });
+      return;
+    }
+
+    const targetUser = db.users.find((u) => u.id === targetUserId);
+    if (!targetUser || targetUser.approvalStatus !== 'pending') {
+      res.status(404).json({
+        error: 'Solicitação de cadastro pendente não encontrada.',
+      });
+      return;
+    }
+
+    const body = req.body as Record<string, unknown>;
+    const rawGroupIds = Array.isArray(body.groupIds)
+      ? body.groupIds.filter((gid): gid is string => typeof gid === 'string')
+      : typeof body.groupId === 'string' && body.groupId.trim()
+        ? [body.groupId.trim()]
+        : [];
+    const uniqueGroupIds = Array.from(new Set(rawGroupIds));
+
+    if (uniqueGroupIds.length === 0) {
+      res.status(400).json({
+        error: 'Indique pelo menos uma pelada fixa para o peladeiro fazer parte.',
+      });
+      return;
+    }
+
+    for (const gid of uniqueGroupIds) {
+      if (!adminGroupIds.has(gid)) {
+        res.status(403).json({
+          error: 'Você só pode indicar peladas das quais é administrador.',
+        });
+        return;
+      }
+    }
+
+    const assignedRole: UserRole = body.role === 'admin' ? 'admin' : 'player';
+    targetUser.active = true;
+    targetUser.approvalStatus = 'approved';
+
+    const addedGroupIds: string[] = [];
+    for (const gid of uniqueGroupIds) {
+      const group = db.groups.find((g) => g.id === gid);
+      if (!group) continue;
+      const existingMember = group.members.find((m) => m.playerId === targetUser.id);
+      if (existingMember) {
+        existingMember.active = true;
+        existingMember.role = assignedRole;
+      } else {
+        const skills = { ...targetUser.selfSkills };
+        group.members.push({
+          playerId: targetUser.id,
+          role: assignedRole,
+          active: true,
+          adminSkills: skills,
+          finalRating: computeFinalRating(skills),
+          adminReviewed: true,
+          joinedAt: new Date().toISOString(),
+        });
+      }
+      addedGroupIds.push(gid);
+    }
+
+    saveDb(db);
+    res.json({
+      user: sanitizeUser(targetUser),
+      addedGroupIds,
+    });
+  });
+
+  app.post('/api/pending-users/:userId/reject', requireAuth, (req: AuthenticatedRequest, res) => {
+    const requesterId = req.session!.sub;
+    const targetUserId = String(req.params.userId);
+    const db = getDb();
+    const requester = db.users.find((u) => u.id === requesterId && u.active);
+    if (!requester) {
+      res.status(401).json({ error: 'Usuário inválido ou inativo.' });
+      return;
+    }
+
+    const adminGroupIds = getAdminGroupIds(db, requesterId);
+    if (adminGroupIds.size === 0) {
+      res.status(403).json({
+        error: 'Apenas administradores podem recusar solicitações de cadastro.',
+      });
+      return;
+    }
+
+    const targetUser = db.users.find((u) => u.id === targetUserId);
+    if (!targetUser || targetUser.approvalStatus !== 'pending') {
+      res.status(404).json({
+        error: 'Solicitação de cadastro pendente não encontrada.',
+      });
+      return;
+    }
+
+    const reqIds = Array.isArray(targetUser.requestedGroupIds)
+      ? targetUser.requestedGroupIds
+      : [];
+    if (reqIds.length > 0 && !reqIds.some((gid) => adminGroupIds.has(gid))) {
+      res.status(403).json({
+        error: 'Apenas administradores da pelada indicada podem recusar esta solicitação.',
+      });
+      return;
+    }
+
+    targetUser.active = false;
+    targetUser.approvalStatus = 'rejected';
+    saveDb(db);
+    res.json({ rejectedId: targetUser.id });
   });
 
   // ==========================================
